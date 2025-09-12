@@ -1,0 +1,173 @@
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+
+variables:
+  terraformVersion: '1.6.6'
+
+stages:
+- stage: CI
+  displayName: 'Terraform CI Validation'
+  jobs:
+    - job: ValidateTest
+      displayName: 'Validate Test Environment'
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+        - task: TerraformInstaller@1
+          inputs:
+            terraformVersion: '$(terraformVersion)'
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform FMT Test'
+          inputs:
+            provider: 'azurerm'
+            command: 'custom'
+            customCommand: 'fmt -check'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/test'
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Validate Test'
+          inputs:
+            provider: 'azurerm'
+            command: 'validate'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/test'
+        - script: |
+            curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+            cd test
+            tflint --init
+            tflint
+          displayName: 'Run TFLint - Test'
+
+    - job: ValidateProd
+      displayName: 'Validate Prod Environment'
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+        - task: TerraformInstaller@1
+          inputs:
+            terraformVersion: '$(terraformVersion)'
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform FMT Prod'
+          inputs:
+            provider: 'azurerm'
+            command: 'custom'
+            customCommand: 'fmt -check'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Validate Prod'
+          inputs:
+            provider: 'azurerm'
+            command: 'validate'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+        - script: |
+            curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+            cd prod
+            tflint --init
+            tflint
+          displayName: 'Run TFLint - Prod'
+
+- stage: Init
+  displayName: 'Terraform Init'
+  jobs:
+    - job: Init
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+        - task: TerraformInstaller@1
+          inputs:
+            terraformVersion: '$(terraformVersion)'
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Init'
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            backendServiceArm: '<your-service-connection>'
+            backendAzureRmResourceGroupName: '<your-backend-rg>'
+            backendAzureRmStorageAccountName: '<your-storage-account>'
+            backendAzureRmContainerName: '<your-container>'
+            backendAzureRmKey: '$(Build.SourceBranchName).tfstate'
+
+- stage: PlanTest
+  displayName: 'Terraform Plan - Test'
+  condition: startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')
+  dependsOn: Init
+  jobs:
+    - job: PlanTest
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Plan - Test'
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            environmentServiceNameAzureRM: '<your-service-connection>'
+            commandOptions: '-var-file="test.tfvars"'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/test'
+
+- stage: ApplyTest
+  displayName: 'Terraform Apply - Test'
+  condition: startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')
+  dependsOn: PlanTest
+  jobs:
+    - job: ApplyTest
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Apply - Test'
+          inputs:
+            provider: 'azurerm'
+            command: 'apply'
+            environmentServiceNameAzureRM: '<your-service-connection>'
+            commandOptions: '-auto-approve -var-file="test.tfvars"'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/test'
+
+- stage: PlanProd
+  displayName: 'Terraform Plan - Prod'
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  dependsOn: Init
+  jobs:
+    - job: PlanProd
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Plan - Prod'
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            environmentServiceNameAzureRM: '<your-service-connection>'
+            commandOptions: '-var-file="prod.tfvars"'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+
+- stage: ApplyProd
+  displayName: 'Terraform Apply - Prod'
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  dependsOn: PlanProd
+  approval:
+    approvals:
+      - reviewers:
+          - tomasz.cwik@example.com
+  jobs:
+    - job: ApplyProd
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Apply - Prod'
+          inputs:
+            provider: 'azurerm'
+            command: 'apply'
+            environmentServiceNameAzureRM: '<your-service-connection>'
+            commandOptions: '-auto-approve -var-file="prod.tfvars"'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
