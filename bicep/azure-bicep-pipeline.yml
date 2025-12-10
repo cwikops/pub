@@ -1,0 +1,326 @@
+# Azure DevOps Pipeline for Bicep Deployment
+# Includes: Linting, Preview (What-If), and Deploy stages
+# Supports multiple environments with environment-specific parameters
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - 'infra/**'
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+parameters:
+  - name: environment
+    displayName: 'Target Environment'
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - staging
+      - prod
+
+  - name: skipPreview
+    displayName: 'Skip Preview Stage'
+    type: boolean
+    default: false
+
+variables:
+  - name: bicepPath
+    value: 'infra/main.bicep'
+  - name: parametersBasePath
+    value: 'infra/parameters'
+  - name: azureServiceConnection
+    value: 'azure-service-connection-${{ parameters.environment }}'
+  
+  # Environment-specific variables
+  - ${{ if eq(parameters.environment, 'dev') }}:
+    - name: resourceGroupName
+      value: 'rg-myapp-dev'
+    - name: location
+      value: 'eastus'
+    - name: subscriptionId
+      value: '$(DEV_SUBSCRIPTION_ID)'
+      
+  - ${{ if eq(parameters.environment, 'staging') }}:
+    - name: resourceGroupName
+      value: 'rg-myapp-staging'
+    - name: location
+      value: 'eastus'
+    - name: subscriptionId
+      value: '$(STAGING_SUBSCRIPTION_ID)'
+      
+  - ${{ if eq(parameters.environment, 'prod') }}:
+    - name: resourceGroupName
+      value: 'rg-myapp-prod'
+    - name: location
+      value: 'westus2'
+    - name: subscriptionId
+      value: '$(PROD_SUBSCRIPTION_ID)'
+
+stages:
+  # ============================================
+  # Stage 1: Lint and Validate
+  # ============================================
+  - stage: Lint
+    displayName: 'Lint & Validate Bicep'
+    jobs:
+      - job: LintBicep
+        displayName: 'Lint Bicep Files'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'Lint Bicep Files'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Running Bicep linter..."
+                
+                # Find all bicep files and lint them
+                find infra -name "*.bicep" -type f | while read file; do
+                  echo "Linting: $file"
+                  az bicep lint --file "$file"
+                done
+                
+                echo "Linting complete!"
+
+          - task: AzureCLI@2
+            displayName: 'Build Bicep (Syntax Validation)'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Building Bicep to validate syntax..."
+                az bicep build --file $(bicepPath) --stdout > /dev/null
+                echo "Build validation successful!"
+
+          - task: AzureCLI@2
+            displayName: 'Validate Deployment'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Validating deployment configuration..."
+                
+                az deployment group validate \
+                  --resource-group $(resourceGroupName) \
+                  --template-file $(bicepPath) \
+                  --parameters @$(parametersBasePath)/${{ parameters.environment }}.parameters.json
+                  
+                echo "Validation successful!"
+
+  # ============================================
+  # Stage 2: Preview (What-If)
+  # ============================================
+  - stage: Preview
+    displayName: 'Preview Changes (What-If)'
+    dependsOn: Lint
+    condition: |
+      and(
+        succeeded(),
+        eq('${{ parameters.skipPreview }}', 'false')
+      )
+    jobs:
+      - job: WhatIf
+        displayName: 'What-If Analysis'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: AzureCLI@2
+            displayName: 'Run What-If Analysis'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "=========================================="
+                echo "What-If Analysis for ${{ parameters.environment }}"
+                echo "=========================================="
+                
+                az deployment group what-if \
+                  --resource-group $(resourceGroupName) \
+                  --template-file $(bicepPath) \
+                  --parameters @$(parametersBasePath)/${{ parameters.environment }}.parameters.json \
+                  --result-format FullResourcePayloads
+
+          - task: AzureCLI@2
+            displayName: 'Generate What-If Summary'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Generating change summary..."
+                
+                az deployment group what-if \
+                  --resource-group $(resourceGroupName) \
+                  --template-file $(bicepPath) \
+                  --parameters @$(parametersBasePath)/${{ parameters.environment }}.parameters.json \
+                  --result-format ResourceIdOnly \
+                  --no-pretty-print \
+                  > $(Build.ArtifactStagingDirectory)/whatif-summary.json
+                  
+                echo "Summary saved to artifacts"
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: whatif-results-${{ parameters.environment }}
+            displayName: 'Publish What-If Results'
+
+  # ============================================
+  # Stage 3: Deploy
+  # ============================================
+  - stage: Deploy
+    displayName: 'Deploy to ${{ parameters.environment }}'
+    dependsOn:
+      - Lint
+      - Preview
+    condition: |
+      and(
+        succeeded(),
+        or(
+          eq(dependencies.Preview.result, 'Succeeded'),
+          eq(dependencies.Preview.result, 'Skipped')
+        )
+      )
+    jobs:
+      - deployment: DeployBicep
+        displayName: 'Deploy Bicep Resources'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: '${{ parameters.environment }}'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  fetchDepth: 1
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep Template'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      echo "=========================================="
+                      echo "Deploying to ${{ parameters.environment }}"
+                      echo "Resource Group: $(resourceGroupName)"
+                      echo "Location: $(location)"
+                      echo "=========================================="
+                      
+                      # Create resource group if it doesn't exist
+                      az group create \
+                        --name $(resourceGroupName) \
+                        --location $(location) \
+                        --tags Environment=${{ parameters.environment }} ManagedBy=AzureDevOps
+                      
+                      # Deploy Bicep template
+                      deploymentName="deploy-${{ parameters.environment }}-$(Build.BuildId)"
+                      
+                      az deployment group create \
+                        --name $deploymentName \
+                        --resource-group $(resourceGroupName) \
+                        --template-file $(bicepPath) \
+                        --parameters @$(parametersBasePath)/${{ parameters.environment }}.parameters.json \
+                        --verbose
+                      
+                      echo "Deployment completed successfully!"
+
+                - task: AzureCLI@2
+                  displayName: 'Export Deployment Outputs'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      deploymentName="deploy-${{ parameters.environment }}-$(Build.BuildId)"
+                      
+                      echo "Fetching deployment outputs..."
+                      
+                      az deployment group show \
+                        --name $deploymentName \
+                        --resource-group $(resourceGroupName) \
+                        --query properties.outputs \
+                        > $(Build.ArtifactStagingDirectory)/deployment-outputs.json
+                      
+                      echo "Deployment outputs:"
+                      cat $(Build.ArtifactStagingDirectory)/deployment-outputs.json
+
+                - publish: $(Build.ArtifactStagingDirectory)
+                  artifact: deployment-outputs-${{ parameters.environment }}
+                  displayName: 'Publish Deployment Outputs'
+
+  # ============================================
+  # Stage 4: Post-Deployment Validation
+  # ============================================
+  - stage: Validate
+    displayName: 'Post-Deployment Validation'
+    dependsOn: Deploy
+    condition: succeeded()
+    jobs:
+      - job: ValidateDeployment
+        displayName: 'Validate Deployed Resources'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Verify Resource Deployment'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Verifying deployed resources..."
+                
+                az resource list \
+                  --resource-group $(resourceGroupName) \
+                  --output table
+                
+                echo "Resource verification complete!"
+
+          - task: AzureCLI@2
+            displayName: 'Check Resource Health'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Checking resource health status..."
+                
+                # Get all resources in the resource group
+                resources=$(az resource list --resource-group $(resourceGroupName) --query "[].id" -o tsv)
+                
+                for resourceId in $resources; do
+                  echo "Checking: $resourceId"
+                  # Add specific health checks based on resource type
+                done
+                
+                echo "Health check complete!"

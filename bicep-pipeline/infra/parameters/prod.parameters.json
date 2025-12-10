@@ -1,0 +1,29 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environment": {
+      "value": "prod"
+    },
+    "baseName": {
+      "value": "myapp"
+    },
+    "appServicePlanSku": {
+      "value": "P1v2"
+    },
+    "enableAppInsights": {
+      "value": true
+    },
+    "storageAccountSku": {
+      "value": "Standard_ZRS"
+    },
+    "tags": {
+      "value": {
+        "Project": "MyApplication",
+        "CostCenter": "Production",
+        "Owner": "PlatformTeam",
+        "Criticality": "High"
+      }
+    }
+  }
+}
