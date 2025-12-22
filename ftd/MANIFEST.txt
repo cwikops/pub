@@ -1,0 +1,37 @@
+FTD Restart Automation - File Manifest
+=======================================
+
+CORE SCRIPTS (Required):
+- scripts/restart_ftd.py          Main Python script for FTD restart
+- setup-azure-resources.sh        Azure resource setup automation
+- requirements.txt                Python dependencies
+- azure-pipelines-simple.yml      Azure DevOps pipeline (simple)
+- azure-pipelines.yml             Azure DevOps pipeline (multi-env)
+
+DOCUMENTATION (Recommended):
+- START_HERE.md                   Quick start guide (READ THIS FIRST!)
+- QUICKSTART.md                   5-minute setup instructions
+- README.md                       Complete documentation
+- DEPLOYMENT.md                   Deployment overview
+- RUNBOOK.md                      Operational procedures
+- PIPELINE_VARIABLES.md           Configuration reference
+- FILE_LIST.md                    Complete file inventory
+
+HELPER SCRIPTS (Optional):
+- restart_ftd.py                  Script copy (reference)
+- setup-keyvault.sh               Alternative setup script
+- test_connectivity.py            FTD connectivity tester
+
+DIRECTORIES:
+- scripts/                        Contains main restart script
+- docs/                           Empty (for your additions)
+
+Total Files: 15
+Package Size: ~75 KB
+
+TO GET STARTED:
+1. Read START_HERE.md
+2. Run setup-azure-resources.sh
+3. Follow QUICKSTART.md
+
+ALL FILES ARE PRESENT ✓

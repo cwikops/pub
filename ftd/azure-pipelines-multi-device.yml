@@ -1,0 +1,168 @@
+trigger: none
+
+# Pipeline for managing multiple FTD devices with variable groups
+# Supports restarting multiple FTD devices in sequence
+
+parameters:
+  - name: targetDevices
+    displayName: 'Target FTD Device(s)'
+    type: object
+    default:
+      - ftd-prod-1
+    values:
+      - ftd-prod-1
+      - ftd-prod-2
+      - ftd-staging-1
+      - ftd-dev-1
+  
+  - name: restartMode
+    displayName: 'Restart Mode'
+    type: string
+    default: 'GRACEFUL'
+    values:
+      - GRACEFUL
+      - FORCED
+  
+  - name: sequentialRestart
+    displayName: 'Sequential Restart (for HA pairs)'
+    type: boolean
+    default: true
+  
+  - name: delayBetweenRestarts
+    displayName: 'Delay Between Restarts (seconds)'
+    type: number
+    default: 600
+
+variables:
+  - name: keyVaultName
+    value: 'your-keyvault-name'
+  - name: azureSubscription
+    value: 'your-service-connection-name'
+  - name: pythonVersion
+    value: '3.11'
+  
+  # Variable group containing FTD device mappings
+  - group: ftd-device-inventory
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: PreCheck
+    displayName: 'Pre-Restart Validation'
+    jobs:
+      - job: ValidateDevices
+        displayName: 'Validate Target Devices'
+        steps:
+          - bash: |
+              echo "##[section]Validating Target Devices"
+              echo "Selected devices: ${{ join(',', parameters.targetDevices) }}"
+              echo "Restart mode: ${{ parameters.restartMode }}"
+              echo "Sequential restart: ${{ parameters.sequentialRestart }}"
+              
+              if [ "${{ parameters.sequentialRestart }}" == "True" ]; then
+                echo "Delay between restarts: ${{ parameters.delayBetweenRestarts }} seconds"
+              fi
+              
+              # Validate device count for HA scenarios
+              DEVICE_COUNT=$(echo "${{ join(',', parameters.targetDevices) }}" | tr ',' '\n' | wc -l)
+              echo "Device count: $DEVICE_COUNT"
+              
+              if [ $DEVICE_COUNT -gt 1 ] && [ "${{ parameters.sequentialRestart }}" != "True" ]; then
+                echo "##vso[task.logissue type=warning]Multiple devices selected without sequential restart"
+                echo "##vso[task.logissue type=warning]Network outage will occur if HA pair is restarted simultaneously"
+              fi
+              
+              echo "##[section]Validation completed"
+            displayName: 'Validate Configuration'
+
+  - ${{ each device in parameters.targetDevices }}:
+    - stage: Restart_${{ replace(device, '-', '_') }}
+      displayName: 'Restart ${{ device }}'
+      dependsOn: 
+        - PreCheck
+        - ${{ if and(ne(parameters.targetDevices[0], device), parameters.sequentialRestart) }}:
+          - Restart_${{ replace(parameters.targetDevices[0], '-', '_') }}
+      jobs:
+        - deployment: RestartDevice
+          displayName: 'Restart ${{ device }}'
+          environment: 'production'
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+                  
+                  - task: UsePythonVersion@0
+                    displayName: 'Setup Python ${{ variables.pythonVersion }}'
+                    inputs:
+                      versionSpec: '${{ variables.pythonVersion }}'
+                  
+                  - bash: |
+                      pip install requests urllib3 --quiet
+                    displayName: 'Install Dependencies'
+                  
+                  - task: AzureKeyVault@2
+                    displayName: 'Get Credentials from Key Vault'
+                    inputs:
+                      azureSubscription: '${{ variables.azureSubscription }}'
+                      KeyVaultName: '${{ variables.keyVaultName }}'
+                      SecretsFilter: 'ftd-username,ftd-password'
+                  
+                  - bash: |
+                      echo "##[section]Restarting FTD Device: ${{ device }}"
+                      echo "Device: ${{ device }}"
+                      
+                      # Get device IP from variable group
+                      DEVICE_VAR_NAME="${{ device }}"
+                      FTD_HOST="${DEVICE_VAR_NAME}"
+                      
+                      echo "FTD Host: $FTD_HOST"
+                      
+                      # Execute restart
+                      python restart_ftd.py
+                    displayName: 'Execute Restart for ${{ device }}'
+                    env:
+                      FTD_HOST: $(${{ device }})
+                      FTD_USERNAME: $(ftd-username)
+                      FTD_PASSWORD: $(ftd-password)
+                      RESTART_MODE: ${{ parameters.restartMode }}
+                  
+                  - ${{ if parameters.sequentialRestart }}:
+                    - bash: |
+                        if [ "${{ device }}" != "${{ parameters.targetDevices[-1] }}" ]; then
+                          echo "##[section]Waiting ${{ parameters.delayBetweenRestarts }} seconds before next device"
+                          echo "This allows the current device to stabilize before restarting the next"
+                          sleep ${{ parameters.delayBetweenRestarts }}
+                        fi
+                      displayName: 'Delay Before Next Device'
+                      condition: succeeded()
+
+  - stage: PostRestart
+    displayName: 'Post-Restart Verification'
+    dependsOn: 
+      - ${{ each device in parameters.targetDevices }}:
+        - Restart_${{ replace(device, '-', '_') }}
+    jobs:
+      - job: VerifyAllDevices
+        displayName: 'Verify All Devices'
+        steps:
+          - bash: |
+              echo "##[section]Post-Restart Verification"
+              echo "All restarts completed"
+              echo ""
+              echo "Devices restarted:"
+              echo "${{ join(',', parameters.targetDevices) }}" | tr ',' '\n' | sed 's/^/  - /'
+              echo ""
+              echo "##[section]Manual Verification Required"
+              echo "Please verify the following for each device:"
+              echo ""
+              echo "1. Management interface accessibility"
+              echo "2. Network traffic flow"
+              echo "3. HA synchronization (if applicable)"
+              echo "4. VPN tunnels status"
+              echo "5. Routing tables"
+              echo "6. Interface status"
+              echo ""
+              echo "##[warning]Complete manual verification before closing this pipeline"
+            displayName: 'Verification Checklist'

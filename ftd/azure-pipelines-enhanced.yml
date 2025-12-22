@@ -1,0 +1,347 @@
+trigger: none
+
+parameters:
+  - name: ftdHost
+    displayName: 'FTD Host/IP Address'
+    type: string
+    default: ''
+  
+  - name: restartMode
+    displayName: 'Restart Mode'
+    type: string
+    default: 'GRACEFUL'
+    values:
+      - GRACEFUL
+      - FORCED
+  
+  - name: environment
+    displayName: 'Environment'
+    type: string
+    default: 'production'
+    values:
+      - production
+      - staging
+      - development
+  
+  - name: skipValidation
+    displayName: 'Skip Pre-Restart Validation (Not Recommended)'
+    type: boolean
+    default: false
+
+variables:
+  - name: keyVaultName
+    value: 'your-keyvault-name'
+  - name: azureSubscription
+    value: 'your-service-connection-name'
+  - name: pythonVersion
+    value: '3.11'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: PreValidation
+    displayName: 'Pre-Restart Validation'
+    condition: eq('${{ parameters.skipValidation }}', false)
+    jobs:
+      - job: ValidateFTD
+        displayName: 'Validate FTD Readiness'
+        steps:
+          - checkout: self
+          
+          - task: UsePythonVersion@0
+            displayName: 'Setup Python ${{ variables.pythonVersion }}'
+            inputs:
+              versionSpec: '${{ variables.pythonVersion }}'
+          
+          - bash: |
+              pip install requests urllib3 --quiet
+            displayName: 'Install Dependencies'
+          
+          - task: AzureKeyVault@2
+            displayName: 'Retrieve Credentials'
+            inputs:
+              azureSubscription: '${{ variables.azureSubscription }}'
+              KeyVaultName: '${{ variables.keyVaultName }}'
+              SecretsFilter: 'ftd-username,ftd-password'
+          
+          - bash: |
+              echo "##[section]Running Pre-Restart Validation"
+              python validate_ftd.py
+            displayName: 'Validate FTD Status'
+            env:
+              FTD_HOST: ${{ parameters.ftdHost }}
+              FTD_USERNAME: $(ftd-username)
+              FTD_PASSWORD: $(ftd-password)
+            continueOnError: false
+          
+          - bash: |
+              echo "##[section]Validation Completed Successfully"
+              echo "FTD is ready for restart"
+            displayName: 'Validation Summary'
+            condition: succeeded()
+
+  - stage: ApprovalGate
+    displayName: 'Restart Approval'
+    dependsOn: 
+      - ${{ if eq(parameters.skipValidation, false) }}:
+        - PreValidation
+    jobs:
+      - job: WaitForApproval
+        displayName: 'Manual Approval Required'
+        pool: server
+        timeoutInMinutes: 1440  # 24 hours
+        steps:
+          - task: ManualValidation@0
+            displayName: 'Approve FTD Restart'
+            inputs:
+              notifyUsers: ''
+              instructions: |
+                Please review the following before approving:
+                
+                FTD Host: ${{ parameters.ftdHost }}
+                Restart Mode: ${{ parameters.restartMode }}
+                Environment: ${{ parameters.environment }}
+                
+                ⚠️  IMPORTANT WARNINGS:
+                - Network traffic will be interrupted during restart
+                - Expected downtime: 10-15 minutes
+                - Ensure maintenance window is active
+                - Verify backup configuration exists
+                - Coordinate with FMC if applicable
+                - Notify relevant teams
+                
+                Validation Status: ${{ eq(parameters.skipValidation, false) and 'Completed' or 'SKIPPED' }}
+                
+                Click "Resume" to proceed with restart or "Reject" to cancel.
+
+  - stage: RestartFTD
+    displayName: 'Execute FTD Restart'
+    dependsOn: ApprovalGate
+    jobs:
+      - deployment: RestartDevice
+        displayName: 'Restart FTD Device'
+        environment: '${{ parameters.environment }}'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                
+                - task: UsePythonVersion@0
+                  displayName: 'Setup Python ${{ variables.pythonVersion }}'
+                  inputs:
+                    versionSpec: '${{ variables.pythonVersion }}'
+                
+                - bash: |
+                    pip install requests urllib3 --quiet
+                  displayName: 'Install Dependencies'
+                
+                - task: AzureKeyVault@2
+                  displayName: 'Retrieve Credentials'
+                  inputs:
+                    azureSubscription: '${{ variables.azureSubscription }}'
+                    KeyVaultName: '${{ variables.keyVaultName }}'
+                    SecretsFilter: 'ftd-username,ftd-password'
+                
+                - bash: |
+                    echo "##[section]Executing FTD Restart"
+                    echo "Target: ${{ parameters.ftdHost }}"
+                    echo "Mode: ${{ parameters.restartMode }}"
+                    echo "Environment: ${{ parameters.environment }}"
+                    echo ""
+                    
+                    START_TIME=$(date +%s)
+                    
+                    python restart_ftd.py
+                    
+                    END_TIME=$(date +%s)
+                    DURATION=$((END_TIME - START_TIME))
+                    
+                    echo ""
+                    echo "##[section]Restart Request Completed"
+                    echo "Duration: ${DURATION} seconds"
+                  displayName: 'Execute Restart'
+                  env:
+                    FTD_HOST: ${{ parameters.ftdHost }}
+                    FTD_USERNAME: $(ftd-username)
+                    FTD_PASSWORD: $(ftd-password)
+                    RESTART_MODE: ${{ parameters.restartMode }}
+                  continueOnError: false
+                
+                - bash: |
+                    echo "##[section]Creating Restart Record"
+                    
+                    # Create restart log entry
+                    TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+                    PIPELINE_URL="$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    
+                    echo "Restart Details:"
+                    echo "  Timestamp: $TIMESTAMP"
+                    echo "  FTD Host: ${{ parameters.ftdHost }}"
+                    echo "  Restart Mode: ${{ parameters.restartMode }}"
+                    echo "  Environment: ${{ parameters.environment }}"
+                    echo "  Initiated By: $(Build.RequestedFor)"
+                    echo "  Pipeline: $(Build.DefinitionName)"
+                    echo "  Build: $(Build.BuildNumber)"
+                    echo "  Pipeline URL: $PIPELINE_URL"
+                    echo ""
+                    echo "This information can be used for audit and change management purposes"
+                  displayName: 'Record Restart Details'
+
+  - stage: PostRestartMonitoring
+    displayName: 'Post-Restart Monitoring'
+    dependsOn: RestartFTD
+    jobs:
+      - job: MonitorRecovery
+        displayName: 'Monitor FTD Recovery'
+        steps:
+          - bash: |
+              echo "##[section]Monitoring FTD Recovery"
+              echo "Waiting initial 5 minutes for boot sequence..."
+              sleep 300
+              
+              MAX_ATTEMPTS=12
+              ATTEMPT=0
+              SUCCESS=false
+              
+              echo ""
+              echo "Starting connectivity checks..."
+              echo "Maximum attempts: $MAX_ATTEMPTS (1 minute intervals)"
+              echo ""
+              
+              while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+                ATTEMPT=$((ATTEMPT + 1))
+                echo "[$ATTEMPT/$MAX_ATTEMPTS] Checking FTD availability..."
+                
+                if curl -k -s --connect-timeout 10 "https://${{ parameters.ftdHost }}" > /dev/null 2>&1; then
+                  echo "##[section]✅ SUCCESS: FTD is responding"
+                  echo "FTD recovered successfully"
+                  echo "Accessible at: https://${{ parameters.ftdHost }}"
+                  SUCCESS=true
+                  break
+                fi
+                
+                if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                  echo "Not yet available, waiting 60 seconds..."
+                  sleep 60
+                fi
+              done
+              
+              if [ "$SUCCESS" = false ]; then
+                echo "##vso[task.logissue type=error]FTD did not respond after $MAX_ATTEMPTS attempts"
+                echo "##vso[task.logissue type=error]Manual intervention required"
+                exit 1
+              fi
+            displayName: 'Monitor FTD Availability'
+            continueOnError: true
+            timeoutInMinutes: 30
+          
+          - task: AzureKeyVault@2
+            displayName: 'Retrieve Credentials for Validation'
+            inputs:
+              azureSubscription: '${{ variables.azureSubscription }}'
+              KeyVaultName: '${{ variables.keyVaultName }}'
+              SecretsFilter: 'ftd-username,ftd-password'
+            condition: succeededOrFailed()
+          
+          - task: UsePythonVersion@0
+            displayName: 'Setup Python for Validation'
+            inputs:
+              versionSpec: '${{ variables.pythonVersion }}'
+            condition: succeededOrFailed()
+          
+          - bash: |
+              pip install requests urllib3 --quiet
+            displayName: 'Install Dependencies'
+            condition: succeededOrFailed()
+          
+          - bash: |
+              echo "##[section]Post-Restart Validation"
+              python validate_ftd.py
+            displayName: 'Validate FTD Post-Restart'
+            env:
+              FTD_HOST: ${{ parameters.ftdHost }}
+              FTD_USERNAME: $(ftd-username)
+              FTD_PASSWORD: $(ftd-password)
+            continueOnError: true
+            condition: succeededOrFailed()
+
+  - stage: ManualVerification
+    displayName: 'Manual Verification'
+    dependsOn: PostRestartMonitoring
+    condition: succeededOrFailed()
+    jobs:
+      - job: VerificationChecklist
+        displayName: 'Manual Verification Required'
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@0
+            displayName: 'Complete Manual Verification'
+            inputs:
+              notifyUsers: ''
+              instructions: |
+                FTD Restart has been executed. Please complete the following verification:
+                
+                📋 VERIFICATION CHECKLIST:
+                
+                [ ] FTD management interface is accessible at https://${{ parameters.ftdHost }}
+                [ ] Can log in to FTD management interface
+                [ ] All network interfaces are UP
+                [ ] Network traffic is flowing normally
+                [ ] FMC connectivity verified (if applicable)
+                [ ] VPN tunnels re-established
+                [ ] Routing tables correct
+                [ ] NAT policies functional
+                [ ] Access control policies active
+                [ ] No critical errors in logs
+                [ ] All services running normally
+                
+                🔍 ADDITIONAL CHECKS:
+                
+                [ ] Monitor FTD for 15-30 minutes
+                [ ] Verify application performance
+                [ ] Check for any user reports of issues
+                [ ] Review FTD system logs
+                [ ] Document any anomalies
+                
+                ⚠️  IF ISSUES DETECTED:
+                
+                1. Document the issue
+                2. Check FTD logs: show logging
+                3. Verify configuration: show running-config
+                4. Contact Cisco TAC if needed
+                5. Consider rollback if critical
+                
+                Click "Resume" after completing verification.
+
+  - stage: Complete
+    displayName: 'Restart Complete'
+    dependsOn: ManualVerification
+    jobs:
+      - job: CompletionSummary
+        displayName: 'Summary and Cleanup'
+        steps:
+          - bash: |
+              echo "##[section]=================================="
+              echo "  FTD RESTART PROCESS COMPLETED"
+              echo "=================================="
+              echo ""
+              echo "FTD Host: ${{ parameters.ftdHost }}"
+              echo "Restart Mode: ${{ parameters.restartMode }}"
+              echo "Environment: ${{ parameters.environment }}"
+              echo "Completed: $(date)"
+              echo ""
+              echo "Pipeline Details:"
+              echo "  Build: $(Build.BuildNumber)"
+              echo "  Initiated By: $(Build.RequestedFor)"
+              echo "  Status: $(Agent.JobStatus)"
+              echo ""
+              echo "##[section]Next Steps:"
+              echo "1. Continue monitoring FTD for next 24 hours"
+              echo "2. Review logs for any warnings or errors"
+              echo "3. Update change management documentation"
+              echo "4. Close maintenance window"
+              echo ""
+            displayName: 'Completion Summary'

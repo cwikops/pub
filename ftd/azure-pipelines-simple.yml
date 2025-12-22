@@ -1,0 +1,96 @@
+# Simplified Azure DevOps Pipeline for Cisco FTD Restart
+# Alternative version with simpler structure
+
+trigger: none
+
+parameters:
+  - name: ftdEnvironment
+    displayName: 'FTD Environment'
+    type: string
+    default: 'production'
+    values:
+      - production
+      - staging
+      - development
+  
+  - name: restartMode
+    displayName: 'Restart Mode'
+    type: string
+    default: 'GRACEFUL'
+    values:
+      - GRACEFUL
+      - FORCED
+  
+  - name: confirmRestart
+    displayName: 'Type YES to confirm restart'
+    type: string
+    default: 'NO'
+
+variables:
+  # Update these with your actual values
+  keyVaultName: 'kv-ftd-prod'  # Change per environment
+  serviceConnection: 'Azure-ServiceConnection'  # Your Azure service connection name
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+jobs:
+  - job: RestartFTD
+    displayName: 'Restart Cisco FTD Device'
+    
+    steps:
+      # Safety check
+      - bash: |
+          if [ "${{ parameters.confirmRestart }}" != "YES" ]; then
+            echo "##vso[task.logissue type=error]Restart not confirmed"
+            echo "Please set confirmRestart parameter to YES"
+            exit 1
+          fi
+          echo "Restart confirmed for ${{ parameters.ftdEnvironment }} environment"
+        displayName: 'Validate Confirmation'
+      
+      # Setup Python
+      - task: UsePythonVersion@0
+        displayName: 'Use Python 3.11'
+        inputs:
+          versionSpec: '3.11'
+      
+      # Install dependencies
+      - bash: |
+          pip install requests urllib3
+        displayName: 'Install Python packages'
+      
+      # Get secrets from Key Vault
+      - task: AzureKeyVault@2
+        displayName: 'Get FTD credentials from Key Vault'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          KeyVaultName: '$(keyVaultName)'
+          SecretsFilter: 'ftd-host,ftd-username,ftd-password'
+      
+      # Execute restart
+      - bash: |
+          export FTD_HOST="$(ftd-host)"
+          export FTD_USERNAME="$(ftd-username)"
+          export FTD_PASSWORD="$(ftd-password)"
+          export FTD_RESTART_MODE="${{ parameters.restartMode }}"
+          
+          echo "Restarting FTD at $(ftd-host) in ${{ parameters.restartMode }} mode"
+          python scripts/restart_ftd.py
+        displayName: 'Restart FTD Device'
+        env:
+          FTD_HOST: $(ftd-host)
+          FTD_USERNAME: $(ftd-username)
+          FTD_PASSWORD: $(ftd-password)
+      
+      # Success message
+      - bash: |
+          echo "========================================="
+          echo "FTD Restart Completed"
+          echo "========================================="
+          echo "Environment: ${{ parameters.ftdEnvironment }}"
+          echo "Mode: ${{ parameters.restartMode }}"
+          echo "Device will be available in 10-15 minutes"
+          echo "========================================="
+        displayName: 'Display Summary'
+        condition: succeeded()
