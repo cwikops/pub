@@ -80,9 +80,16 @@ stages:
               python3 << 'EOF'
               import json
               import sys
+              import codecs
               
-              with open("alerts_raw.json") as f:
-                  data = json.load(f)
+              with open("alerts_raw.json", "rb") as f:
+                  raw = f.read()
+              
+              # Remove UTF-8 BOM if present
+              if raw.startswith(codecs.BOM_UTF8):
+                  raw = raw[len(codecs.BOM_UTF8):]
+              
+              data = json.loads(raw.decode("utf-8"))
               
               alerts = data.get("value", [])
               
