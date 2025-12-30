@@ -1,0 +1,223 @@
+trigger: none
+
+schedules:
+- cron: "0 2 * * *"
+  displayName: Daily Dependency Security Check
+  branches:
+    include:
+    - main
+  always: true
+
+parameters:
+- name: severityFilter
+  displayName: Minimum Severity to Fix
+  type: string
+  default: 'high'
+  values:
+  - critical
+  - high
+  - medium
+  - low
+
+- name: maxPRs
+  displayName: Maximum PRs to create
+  type: number
+  default: 10
+
+- name: dryRun
+  displayName: Dry Run (don't create PRs)
+  type: boolean
+  default: false
+
+variables:
+  - name: pythonVersion
+    value: '3.11'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: DependencySecurityFix
+  displayName: 'Fix Dependency Vulnerabilities'
+  jobs:
+  - job: ProcessDependencyAlerts
+    displayName: 'Update Vulnerable Dependencies'
+    steps:
+    
+    - checkout: self
+      persistCredentials: true
+      clean: true
+      fetchDepth: 0
+    
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+    
+    - script: |
+        pip install requests
+      displayName: 'Install Python dependencies'
+    
+    - script: |
+        echo "Validating environment variables..."
+        echo "SYSTEM_COLLECTIONURI: $(System.CollectionUri)"
+        echo "SYSTEM_TEAMPROJECT: $(System.TeamProject)"
+        echo "BUILD_REPOSITORY_ID: $(Build.Repository.ID)"
+        echo "BUILD_REPOSITORY_NAME: $(Build.Repository.Name)"
+        echo "PIPELINE_WORKSPACE: $(Pipeline.Workspace)"
+        
+        if [ -z "$(System.AccessToken)" ]; then
+          echo "ERROR: System.AccessToken is not available"
+          exit 1
+        else
+          echo "SYSTEM_ACCESSTOKEN: [SET]"
+        fi
+        
+        echo "All required environment variables are set ✓"
+      displayName: 'Validate Environment'
+    
+    - script: |
+        # Configure git
+        git config user.email "azure-pipeline@company.com"
+        git config user.name "Azure Pipeline Bot"
+        
+        # Verify script exists
+        if [ ! -f "dependency_security_fixer.py" ]; then
+          echo "ERROR: dependency_security_fixer.py not found in repository"
+          echo "Please add the script to your repository root"
+          exit 1
+        fi
+        
+        chmod +x dependency_security_fixer.py
+        
+        echo "Setup complete ✓"
+      displayName: 'Setup Script'
+    
+    - script: |
+        python dependency_security_fixer.py \
+          --severity "${{ parameters.severityFilter }}" \
+          --max-prs ${{ parameters.maxPRs }}
+      displayName: 'Fix Dependency Vulnerabilities'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+        SYSTEM_TEAMPROJECT: $(System.TeamProject)
+        BUILD_REPOSITORY_ID: $(Build.Repository.ID)
+        BUILD_REPOSITORY_NAME: $(Build.Repository.Name)
+        PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+      condition: and(succeeded(), eq('${{ parameters.dryRun }}', 'false'))
+    
+    - script: |
+        echo "═══════════════════════════════════════════════════════"
+        echo "  DRY RUN MODE - No PRs will be created"
+        echo "═══════════════════════════════════════════════════════"
+        python dependency_security_fixer.py \
+          --severity "${{ parameters.severityFilter }}" \
+          --max-prs ${{ parameters.maxPRs }} \
+          --dry-run
+      displayName: 'Fix Dependency Vulnerabilities (Dry Run)'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+        SYSTEM_TEAMPROJECT: $(System.TeamProject)
+        BUILD_REPOSITORY_ID: $(Build.Repository.ID)
+        BUILD_REPOSITORY_NAME: $(Build.Repository.Name)
+        PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+      condition: and(succeeded(), eq('${{ parameters.dryRun }}', 'true'))
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Summary'
+      condition: always()
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/dependency-fix-summary.json'
+        artifact: 'DependencyFixSummary'
+        publishLocation: 'pipeline'
+    
+    # Optional: Install and test updated dependencies
+    - script: |
+        if [ -f "requirements.txt" ]; then
+          echo "Testing updated requirements..."
+          pip install -r requirements.txt --dry-run
+          echo "Requirements validation complete ✓"
+        fi
+      displayName: 'Validate Requirements (Optional)'
+      condition: and(succeeded(), eq('${{ parameters.dryRun }}', 'false'))
+      continueOnError: true
+
+- stage: GenerateReport
+  displayName: 'Generate Summary Report'
+  dependsOn: DependencySecurityFix
+  condition: succeededOrFailed()
+  jobs:
+  - job: CreateReport
+    displayName: 'Create Dependency Fix Summary'
+    steps:
+    
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Summary'
+      inputs:
+        artifactName: 'DependencyFixSummary'
+        targetPath: '$(Pipeline.Workspace)/summary'
+    
+    - task: PowerShell@2
+      displayName: 'Generate Report'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $summaryPath = "$(Pipeline.Workspace)/summary/dependency-fix-summary.json"
+          
+          if (Test-Path $summaryPath) {
+            $summary = Get-Content $summaryPath | ConvertFrom-Json
+            
+            $report = @"
+          # Dependency Security Fix Summary
+          
+          **Execution Time:** $($summary.timestamp)
+          **Mode:** $(if ($summary.dry_run) { "DRY RUN" } else { "PRODUCTION" })
+          
+          ## Results
+          
+          | Metric | Count |
+          |--------|-------|
+          | Total Dependency Alerts | $($summary.total_dependency_alerts) |
+          | Alerts Processed | $($summary.alerts_processed) |
+          | PRs Created | $($summary.prs_created) |
+          
+          ## Status: $($summary.status.ToUpper())
+          
+          "@
+            
+            if ($summary.processed_details.Count -gt 0) {
+              $report += "`n## Updated Packages`n`n"
+              $report += "| Package | Version | Severity | Status | Files |`n"
+              $report += "|---------|---------|----------|--------|-------|`n"
+              
+              foreach ($detail in $summary.processed_details) {
+                $files = if ($detail.files_updated) { 
+                  ($detail.files_updated -join ", ") 
+                } else { 
+                  "N/A" 
+                }
+                $report += "| $($detail.package) | $($detail.fixed_version) | $($detail.severity) | $($detail.status) | $files |`n"
+              }
+            } else {
+              $report += "`n*No dependency alerts were processed in this run.*`n"
+            }
+            
+            $report += "`n---`n"
+            $report += "*Generated by Dependency Security Auto-Fix Pipeline*`n"
+            
+            $report | Out-File -FilePath "$(Pipeline.Workspace)/dependency-report.md" -Encoding utf8
+            
+            Write-Host "##vso[task.uploadsummary]$(Pipeline.Workspace)/dependency-report.md"
+          } else {
+            Write-Warning "Summary file not found at $summaryPath"
+          }
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Report'
+      condition: succeeded()
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/dependency-report.md'
+        artifact: 'DependencyReport'
+        publishLocation: 'pipeline'
