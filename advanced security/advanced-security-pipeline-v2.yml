@@ -53,6 +53,26 @@ stages:
         pip install requests pyyaml
       displayName: 'Install Python dependencies'
     
+    - script: |
+        echo "Validating environment variables..."
+        echo "SYSTEM_COLLECTIONURI: $(System.CollectionUri)"
+        echo "SYSTEM_TEAMPROJECT: $(System.TeamProject)"
+        echo "BUILD_REPOSITORY_ID: $(Build.Repository.ID)"
+        echo "BUILD_REPOSITORY_NAME: $(Build.Repository.Name)"
+        echo "PIPELINE_WORKSPACE: $(Pipeline.Workspace)"
+        
+        # Check if System.AccessToken is available (don't print it)
+        if [ -z "$(System.AccessToken)" ]; then
+          echo "ERROR: System.AccessToken is not available"
+          echo "Make sure the pipeline has access to the OAuth token"
+          exit 1
+        else
+          echo "SYSTEM_ACCESSTOKEN: [SET]"
+        fi
+        
+        echo "All required environment variables are set ✓"
+      displayName: 'Validate Environment Variables'
+    
     # Download config and script (if stored in repo)
     - script: |
         echo "Checking for security-fix-config.yml..."
@@ -74,7 +94,7 @@ stages:
       displayName: 'Run Security Alert Fixer'
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-        SYSTEM_COLLECTIONURI: $(System.TeamFoundationCollectionUri)
+        SYSTEM_COLLECTIONURI: $(System.CollectionUri)
         SYSTEM_TEAMPROJECT: $(System.TeamProject)
         BUILD_REPOSITORY_ID: $(Build.Repository.ID)
         BUILD_REPOSITORY_NAME: $(Build.Repository.Name)
@@ -87,7 +107,7 @@ stages:
       displayName: 'Run Security Alert Fixer (Dry Run)'
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-        SYSTEM_COLLECTIONURI: $(System.TeamFoundationCollectionUri)
+        SYSTEM_COLLECTIONURI: $(System.CollectionUri)
         SYSTEM_TEAMPROJECT: $(System.TeamProject)
         BUILD_REPOSITORY_ID: $(Build.Repository.ID)
         BUILD_REPOSITORY_NAME: $(Build.Repository.Name)

@@ -21,11 +21,29 @@ class SecurityAlertFixer:
     """Main class for processing and fixing security alerts"""
     
     def __init__(self, config_path: str = 'security-fix-config.yml'):
-        self.organization = os.environ.get('SYSTEM_COLLECTIONURI', '').rstrip('/').split('/')[-1]
-        self.project = os.environ.get('SYSTEM_TEAMPROJECT')
-        self.repository_id = os.environ.get('BUILD_REPOSITORY_ID')
-        self.repo_name = os.environ.get('BUILD_REPOSITORY_NAME')
-        self.pat = os.environ.get('SYSTEM_ACCESSTOKEN')
+        # Validate required environment variables
+        required_vars = {
+            'SYSTEM_COLLECTIONURI': os.environ.get('SYSTEM_COLLECTIONURI'),
+            'SYSTEM_TEAMPROJECT': os.environ.get('SYSTEM_TEAMPROJECT'),
+            'BUILD_REPOSITORY_ID': os.environ.get('BUILD_REPOSITORY_ID'),
+            'BUILD_REPOSITORY_NAME': os.environ.get('BUILD_REPOSITORY_NAME'),
+            'SYSTEM_ACCESSTOKEN': os.environ.get('SYSTEM_ACCESSTOKEN')
+        }
+        
+        missing_vars = [name for name, value in required_vars.items() if not value]
+        if missing_vars:
+            raise EnvironmentError(
+                f"Missing required environment variables: {', '.join(missing_vars)}\n"
+                f"This script must be run within an Azure DevOps pipeline context.\n"
+                f"Required variables: SYSTEM_COLLECTIONURI, SYSTEM_TEAMPROJECT, "
+                f"BUILD_REPOSITORY_ID, BUILD_REPOSITORY_NAME, SYSTEM_ACCESSTOKEN"
+            )
+        
+        self.organization = required_vars['SYSTEM_COLLECTIONURI'].rstrip('/').split('/')[-1]
+        self.project = required_vars['SYSTEM_TEAMPROJECT']
+        self.repository_id = required_vars['BUILD_REPOSITORY_ID']
+        self.repo_name = required_vars['BUILD_REPOSITORY_NAME']
+        self.pat = required_vars['SYSTEM_ACCESSTOKEN']
         
         self.base_url = f"https://advsec.dev.azure.com/{self.organization}/{self.project}/_apis"
         self.headers = {
@@ -668,26 +686,43 @@ def main():
     
     args = parser.parse_args()
     
-    fixer = SecurityAlertFixer(config_path=args.config)
-    fixer.dry_run = args.dry_run
-    
-    if args.dry_run:
-        print("\n" + "="*60)
-        print("DRY RUN MODE - No PRs will be created")
-        print("="*60 + "\n")
-    
-    summary = fixer.run(severity_filter=args.severity)
-    
-    # Save summary
-    workspace = os.environ.get('PIPELINE_WORKSPACE', '.')
-    summary_path = os.path.join(workspace, 'summary.json')
-    
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    print(f"\nSummary saved to: {summary_path}")
-    
-    return 0 if summary['prs_created'] > 0 else 1
+    try:
+        fixer = SecurityAlertFixer(config_path=args.config)
+        fixer.dry_run = args.dry_run
+        
+        if args.dry_run:
+            print("\n" + "="*60)
+            print("DRY RUN MODE - No PRs will be created")
+            print("="*60 + "\n")
+        
+        summary = fixer.run(severity_filter=args.severity)
+        
+        # Save summary
+        workspace = os.environ.get('PIPELINE_WORKSPACE', '.')
+        summary_path = os.path.join(workspace, 'summary.json')
+        
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"\nSummary saved to: {summary_path}")
+        
+        return 0 if summary['prs_created'] > 0 or args.dry_run else 1
+        
+    except EnvironmentError as e:
+        print(f"\n❌ Environment Error: {e}", file=sys.stderr)
+        print("\nThis script requires the following environment variables:")
+        print("  - SYSTEM_COLLECTIONURI (e.g., https://dev.azure.com/yourorg/)")
+        print("  - SYSTEM_TEAMPROJECT")
+        print("  - BUILD_REPOSITORY_ID")
+        print("  - BUILD_REPOSITORY_NAME")
+        print("  - SYSTEM_ACCESSTOKEN")
+        print("\nThese are automatically set when running in Azure DevOps pipeline.")
+        return 2
+    except Exception as e:
+        print(f"\n❌ Unexpected Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 3
 
 
 if __name__ == '__main__':
