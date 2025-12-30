@@ -37,6 +37,7 @@ class SecurityAlertFixer:
         self.config = self._load_config(config_path)
         self.prs_created = 0
         self.alerts_processed = []
+        self.dry_run = False  # Can be set externally
         
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from YAML file"""
@@ -158,6 +159,16 @@ class SecurityAlertFixer:
         if self._branch_exists(branch_name):
             print(f"  Branch {branch_name} already exists, skipping...")
             return False
+        
+        if self.dry_run:
+            print(f"  [DRY RUN] Would create branch: {branch_name}")
+            print(f"  [DRY RUN] Would apply fix for: {alert_type}")
+            self.alerts_processed.append({
+                'alert_id': alert_id,
+                'severity': severity,
+                'status': 'dry_run_would_fix'
+            })
+            return True
         
         # Create and checkout branch
         self._git_run(['checkout', '-b', branch_name])
@@ -528,6 +539,10 @@ GitHub Advanced Security for Azure DevOps.
             start_line = location.get('region', {}).get('startLine', 0)
             file_info = f"**File:** `{file_path}` (Line {start_line})\n"
         
+        if self.dry_run:
+            print(f"  [DRY RUN] Would create PR: [Security-{severity.upper()}] {title}")
+            return True
+        
         pr_description = f"""## 🔒 Security Fix - Alert #{alert_id}
 
 **Severity:** {severity.upper()}
@@ -590,6 +605,8 @@ This PR automatically applies a fix for the security vulnerability identified by
         """Main execution method"""
         print("="*60)
         print("Advanced Security Auto-Fix Pipeline")
+        if self.dry_run:
+            print("MODE: DRY RUN (No PRs will be created)")
         print("="*60)
         
         # Fetch alerts
@@ -607,13 +624,18 @@ This PR automatically applies a fix for the security vulnerability identified by
                 print(f"\nReached maximum PR limit ({max_prs})")
                 break
             
-            self.process_alert(alert)
+            success = self.process_alert(alert)
+            if success:
+                self.prs_created += 1
         
         # Generate summary
         summary = self._generate_summary(alerts, self.alerts_processed)
         
         print("\n" + "="*60)
-        print(f"Summary: Created {self.prs_created} pull request(s)")
+        if self.dry_run:
+            print(f"Summary: Would have created {self.prs_created} pull request(s)")
+        else:
+            print(f"Summary: Created {self.prs_created} pull request(s)")
         print("="*60)
         
         return summary
@@ -622,11 +644,12 @@ This PR automatically applies a fix for the security vulnerability identified by
         """Generate execution summary"""
         return {
             'timestamp': datetime.now().isoformat(),
+            'dry_run': self.dry_run,
             'total_alerts': len(all_alerts),
             'alerts_processed': len(processed),
             'prs_created': self.prs_created,
             'processed_details': processed,
-            'status': 'success' if self.prs_created > 0 else 'no_prs_created'
+            'status': 'dry_run' if self.dry_run else ('success' if self.prs_created > 0 else 'no_prs_created')
         }
 
 
@@ -640,10 +663,19 @@ def main():
                        help='Minimum severity to process')
     parser.add_argument('--config', default='security-fix-config.yml',
                        help='Path to configuration file')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Run in dry-run mode (no PRs created)')
     
     args = parser.parse_args()
     
     fixer = SecurityAlertFixer(config_path=args.config)
+    fixer.dry_run = args.dry_run
+    
+    if args.dry_run:
+        print("\n" + "="*60)
+        print("DRY RUN MODE - No PRs will be created")
+        print("="*60 + "\n")
+    
     summary = fixer.run(severity_filter=args.severity)
     
     # Save summary
