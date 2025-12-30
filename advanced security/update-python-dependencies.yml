@@ -1,0 +1,459 @@
+# Azure DevOps Pipeline: Automated Python Dependency Updates via uv
+# Scans GitHub Advanced Security alerts and raises PR with updated dependencies
+#
+# Prerequisites:
+# - GitHub Advanced Security enabled on repository
+# - uv installed or available via pip
+# - PAT with repo write + PR creation permissions stored in variable group
+
+trigger: none
+
+schedules:
+  - cron: '0 6 * * 1'  # Weekly on Monday at 6 AM UTC
+    displayName: 'Weekly Security Scan'
+    branches:
+      include:
+        - main
+    always: true
+
+pr: none
+
+parameters:
+  - name: dryRun
+    displayName: 'Dry Run (no PR created)'
+    type: boolean
+    default: false
+  - name: targetBranch
+    displayName: 'Target branch for PR'
+    type: string
+    default: 'main'
+
+variables:
+  - group: security-automation  # Should contain: GH_PAT or ADO_PAT
+  - name: pythonVersion
+    value: '3.11'
+  - name: updateBranchName
+    value: 'automated/security-dependency-update-$(Build.BuildId)'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: ScanAndUpdate
+    displayName: 'Scan Security Alerts & Update Dependencies'
+    jobs:
+      - job: CheckAlerts
+        displayName: 'Check for Vulnerable Dependencies'
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+
+          - task: UsePythonVersion@0
+            displayName: 'Use Python $(pythonVersion)'
+            inputs:
+              versionSpec: '$(pythonVersion)'
+
+          - script: |
+              pip install uv --quiet
+              uv --version
+            displayName: 'Install uv'
+
+          - script: |
+              cat > scan_alerts.py << 'EOF'
+              #!/usr/bin/env python3
+              """
+              Scan for security vulnerabilities using multiple sources:
+              1. pip-audit for known CVEs
+              2. Parse requirements/pyproject for outdated packages
+              """
+              import json
+              import subprocess
+              import sys
+              from pathlib import Path
+
+              def run_pip_audit():
+                  """Run pip-audit to find vulnerable packages."""
+                  print("Running pip-audit scan...")
+                  result = subprocess.run(
+                      ["pip", "install", "pip-audit", "--quiet"],
+                      capture_output=True,
+                      text=True
+                  )
+                  
+                  # Check for requirements files
+                  req_files = list(Path(".").glob("**/requirements*.txt"))
+                  pyproject = Path("pyproject.toml")
+                  
+                  vulnerabilities = []
+                  
+                  for req_file in req_files:
+                      result = subprocess.run(
+                          ["pip-audit", "-r", str(req_file), "--format", "json", "--progress-spinner", "off"],
+                          capture_output=True,
+                          text=True
+                      )
+                      if result.stdout.strip():
+                          try:
+                              vulns = json.loads(result.stdout)
+                              vulnerabilities.extend(vulns)
+                          except json.JSONDecodeError:
+                              pass
+                  
+                  if pyproject.exists():
+                      # For pyproject.toml, audit current environment
+                      result = subprocess.run(
+                          ["pip-audit", "--format", "json", "--progress-spinner", "off"],
+                          capture_output=True,
+                          text=True
+                      )
+                      if result.stdout.strip():
+                          try:
+                              vulns = json.loads(result.stdout)
+                              vulnerabilities.extend(vulns)
+                          except json.JSONDecodeError:
+                              pass
+                  
+                  return vulnerabilities
+
+              def main():
+                  vulnerabilities = run_pip_audit()
+                  
+                  # Deduplicate by package name
+                  unique_vulns = {}
+                  for vuln in vulnerabilities:
+                      pkg_name = vuln.get("name", "")
+                      if pkg_name and pkg_name not in unique_vulns:
+                          unique_vulns[pkg_name] = vuln
+                  
+                  vuln_list = list(unique_vulns.values())
+                  
+                  # Output results
+                  print(f"\nFound {len(vuln_list)} vulnerable package(s)")
+                  
+                  if vuln_list:
+                      print("\nVulnerable packages:")
+                      for v in vuln_list:
+                          print(f"  - {v.get('name', 'unknown')}: {v.get('version', '?')} -> {v.get('fix_versions', ['unknown'])}")
+                      
+                      # Write to file for next stage
+                      with open("vulnerable_packages.json", "w") as f:
+                          json.dump(vuln_list, f, indent=2)
+                      
+                      # Set pipeline variable
+                      print(f"##vso[task.setvariable variable=hasVulnerabilities;isOutput=true]true")
+                      print(f"##vso[task.setvariable variable=vulnCount;isOutput=true]{len(vuln_list)}")
+                  else:
+                      print("No vulnerabilities found!")
+                      print(f"##vso[task.setvariable variable=hasVulnerabilities;isOutput=true]false")
+                      print(f"##vso[task.setvariable variable=vulnCount;isOutput=true]0")
+                  
+                  return 0
+
+              if __name__ == "__main__":
+                  sys.exit(main())
+              EOF
+              python scan_alerts.py
+            name: scanAlerts
+            displayName: 'Scan for Security Vulnerabilities'
+
+          - script: |
+              cat > update_deps.py << 'EOF'
+              #!/usr/bin/env python3
+              """
+              Update vulnerable dependencies using uv.
+              """
+              import json
+              import subprocess
+              import sys
+              from pathlib import Path
+
+              def update_with_uv(packages: list[str]):
+                  """Update packages using uv."""
+                  req_files = list(Path(".").glob("**/requirements*.txt"))
+                  pyproject = Path("pyproject.toml")
+                  uv_lock = Path("uv.lock")
+                  
+                  updated = []
+                  
+                  # If using uv with pyproject.toml
+                  if pyproject.exists():
+                      print("Detected pyproject.toml - using uv lock/sync")
+                      
+                      for pkg in packages:
+                          print(f"Upgrading {pkg}...")
+                          result = subprocess.run(
+                              ["uv", "lock", "--upgrade-package", pkg],
+                              capture_output=True,
+                              text=True
+                          )
+                          if result.returncode == 0:
+                              updated.append(pkg)
+                              print(f"  ✓ {pkg} upgraded")
+                          else:
+                              print(f"  ✗ Failed to upgrade {pkg}: {result.stderr}")
+                      
+                      # Sync to ensure consistency
+                      subprocess.run(["uv", "sync"], capture_output=True)
+                  
+                  # For requirements.txt files
+                  for req_file in req_files:
+                      print(f"\nProcessing {req_file}...")
+                      
+                      # Read current requirements
+                      content = req_file.read_text()
+                      lines = content.splitlines()
+                      new_lines = []
+                      
+                      for line in lines:
+                          line_lower = line.lower().strip()
+                          pkg_updated = False
+                          
+                          for pkg in packages:
+                              if line_lower.startswith(pkg.lower()) or f"/{pkg.lower()}" in line_lower:
+                                  # Get latest version using uv
+                                  result = subprocess.run(
+                                      ["uv", "pip", "compile", "--quiet", "-"],
+                                      input=pkg,
+                                      capture_output=True,
+                                      text=True
+                                  )
+                                  if result.returncode == 0 and result.stdout.strip():
+                                      new_line = result.stdout.strip().split('\n')[0]
+                                      new_lines.append(new_line)
+                                      updated.append(pkg)
+                                      print(f"  ✓ {line.strip()} -> {new_line}")
+                                      pkg_updated = True
+                                      break
+                          
+                          if not pkg_updated:
+                              new_lines.append(line)
+                      
+                      # Write updated requirements
+                      req_file.write_text('\n'.join(new_lines) + '\n')
+                  
+                  return list(set(updated))
+
+              def main():
+                  vuln_file = Path("vulnerable_packages.json")
+                  if not vuln_file.exists():
+                      print("No vulnerable packages file found")
+                      return 0
+                  
+                  with open(vuln_file) as f:
+                      vulnerabilities = json.load(f)
+                  
+                  if not vulnerabilities:
+                      print("No vulnerabilities to fix")
+                      return 0
+                  
+                  packages = [v.get("name") for v in vulnerabilities if v.get("name")]
+                  print(f"Attempting to update {len(packages)} package(s): {', '.join(packages)}")
+                  
+                  updated = update_with_uv(packages)
+                  
+                  print(f"\n{'='*50}")
+                  print(f"Successfully updated: {len(updated)} package(s)")
+                  
+                  if updated:
+                      # Write summary for PR description
+                      with open("update_summary.md", "w") as f:
+                          f.write("## Security Dependency Updates\n\n")
+                          f.write("This PR was automatically generated to address security vulnerabilities.\n\n")
+                          f.write("### Updated Packages\n\n")
+                          for pkg in updated:
+                              vuln = next((v for v in vulnerabilities if v.get("name") == pkg), {})
+                              vulns = vuln.get("vulns", [])
+                              cve_ids = [v.get("id", "Unknown") for v in vulns] if vulns else ["Security update"]
+                              f.write(f"- **{pkg}**: {', '.join(cve_ids)}\n")
+                          f.write("\n### Actions Required\n\n")
+                          f.write("1. Review the changes\n")
+                          f.write("2. Run tests to ensure compatibility\n")
+                          f.write("3. Merge if all checks pass\n")
+                      
+                      print("##vso[task.setvariable variable=hasUpdates;isOutput=true]true")
+                  else:
+                      print("##vso[task.setvariable variable=hasUpdates;isOutput=true]false")
+                  
+                  return 0
+
+              if __name__ == "__main__":
+                  sys.exit(main())
+              EOF
+              python update_deps.py
+            name: updateDeps
+            displayName: 'Update Vulnerable Dependencies'
+            condition: eq(variables['scanAlerts.hasVulnerabilities'], 'true')
+
+          - script: |
+              set -e
+              
+              # Check if there are any changes
+              if [ -z "$(git status --porcelain)" ]; then
+                echo "No changes detected"
+                echo "##vso[task.setvariable variable=hasChanges]false"
+                exit 0
+              fi
+              
+              echo "Changes detected:"
+              git status --porcelain
+              git diff --stat
+              
+              echo "##vso[task.setvariable variable=hasChanges]true"
+            displayName: 'Check for Changes'
+            condition: eq(variables['updateDeps.hasUpdates'], 'true')
+
+          - script: |
+              set -e
+              
+              # Configure git
+              git config user.email "azure-pipelines@dev.azure.com"
+              git config user.name "Azure Pipelines Security Bot"
+              
+              # Create and checkout new branch
+              git checkout -b $(updateBranchName)
+              
+              # Stage and commit changes
+              git add -A
+              git commit -m "fix(security): update vulnerable Python dependencies
+
+              Automated security update via Azure DevOps pipeline.
+              
+              Updated packages based on pip-audit scan results.
+              
+              Pipeline: $(Build.BuildNumber)
+              Build ID: $(Build.BuildId)"
+              
+              # Push branch
+              git push origin $(updateBranchName)
+              
+              echo "Branch $(updateBranchName) pushed successfully"
+            displayName: 'Create and Push Branch'
+            condition: and(eq(variables['hasChanges'], 'true'), eq('${{ parameters.dryRun }}', false))
+
+          - script: |
+              set -e
+              
+              # Read PR description
+              PR_BODY=""
+              if [ -f "update_summary.md" ]; then
+                PR_BODY=$(cat update_summary.md)
+              else
+                PR_BODY="Automated security dependency update"
+              fi
+              
+              # Create PR using Azure DevOps REST API
+              PR_TITLE="fix(security): Update vulnerable Python dependencies"
+              
+              # Construct JSON payload
+              PR_JSON=$(cat <<EOF
+              {
+                "sourceRefName": "refs/heads/$(updateBranchName)",
+                "targetRefName": "refs/heads/${{ parameters.targetBranch }}",
+                "title": "${PR_TITLE}",
+                "description": "${PR_BODY//$'\n'/\\n}",
+                "labels": [
+                  {"name": "security"},
+                  {"name": "automated"},
+                  {"name": "dependencies"}
+                ]
+              }
+              EOF
+              )
+              
+              echo "Creating Pull Request..."
+              
+              # Use Azure DevOps CLI or REST API
+              RESPONSE=$(curl -s -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $(System.AccessToken)" \
+                "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullrequests?api-version=7.1" \
+                -d "${PR_JSON}")
+              
+              PR_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('pullRequestId', 'unknown'))" 2>/dev/null || echo "unknown")
+              
+              if [ "$PR_ID" != "unknown" ] && [ -n "$PR_ID" ]; then
+                echo "✓ Pull Request created successfully!"
+                echo "  PR ID: $PR_ID"
+                PR_URL="$(System.CollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)/pullrequest/$PR_ID"
+                echo "  URL: $PR_URL"
+                echo "##vso[task.setvariable variable=prUrl]$PR_URL"
+                echo "##vso[task.setvariable variable=prId]$PR_ID"
+              else
+                echo "Response: $RESPONSE"
+                echo "##vso[task.logissue type=warning]PR creation may have failed. Check response above."
+              fi
+            displayName: 'Create Pull Request'
+            condition: and(eq(variables['hasChanges'], 'true'), eq('${{ parameters.dryRun }}', false))
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+          - script: |
+              echo "=================================="
+              echo "       DRY RUN SUMMARY           "
+              echo "=================================="
+              echo ""
+              echo "The following changes would be made:"
+              echo ""
+              git status --porcelain
+              echo ""
+              echo "Diff preview:"
+              git diff --stat
+              echo ""
+              if [ -f "update_summary.md" ]; then
+                echo "PR Description would be:"
+                cat update_summary.md
+              fi
+              echo ""
+              echo "No branch was pushed and no PR was created (dry run mode)"
+            displayName: 'Dry Run Summary'
+            condition: and(eq(variables['hasChanges'], 'true'), eq('${{ parameters.dryRun }}', true))
+
+          - script: |
+              echo "=================================="
+              echo "       PIPELINE SUMMARY          "
+              echo "=================================="
+              echo ""
+              echo "Vulnerabilities found: $(scanAlerts.vulnCount)"
+              echo "Updates applied: $(updateDeps.hasUpdates)"
+              echo "Changes committed: $(hasChanges)"
+              echo ""
+              if [ -n "$(prUrl)" ]; then
+                echo "Pull Request: $(prUrl)"
+              fi
+            displayName: 'Pipeline Summary'
+            condition: always()
+
+  - stage: Notify
+    displayName: 'Send Notifications'
+    dependsOn: ScanAndUpdate
+    condition: |
+      and(
+        succeeded(),
+        ne(dependencies.ScanAndUpdate.outputs['CheckAlerts.scanAlerts.hasVulnerabilities'], 'false')
+      )
+    jobs:
+      - job: SendNotification
+        displayName: 'Send Teams/Slack Notification'
+        steps:
+          - script: |
+              # Example: Send to Teams webhook (configure TEAMS_WEBHOOK_URL in variable group)
+              if [ -n "$(TEAMS_WEBHOOK_URL)" ]; then
+                curl -H "Content-Type: application/json" -d '{
+                  "@type": "MessageCard",
+                  "summary": "Security Dependency Update PR Created",
+                  "themeColor": "FFA500",
+                  "title": "🔒 Security Update PR Created",
+                  "sections": [{
+                    "facts": [
+                      {"name": "Repository", "value": "$(Build.Repository.Name)"},
+                      {"name": "Pipeline", "value": "$(Build.BuildNumber)"},
+                      {"name": "Branch", "value": "$(updateBranchName)"}
+                    ]
+                  }]
+                }' "$(TEAMS_WEBHOOK_URL)" || true
+              fi
+              
+              echo "Notification step completed"
+            displayName: 'Send Notification'
+            condition: always()
