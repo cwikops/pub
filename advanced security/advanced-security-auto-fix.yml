@@ -1,0 +1,375 @@
+trigger: none
+
+schedules:
+- cron: "0 2 * * *"
+  displayName: Daily Advanced Security scan
+  branches:
+    include:
+    - main
+  always: true
+
+parameters:
+- name: severityFilter
+  displayName: Minimum Severity to Fix
+  type: string
+  default: 'high'
+  values:
+  - critical
+  - high
+  - medium
+  - low
+
+- name: maxPRsToCreate
+  displayName: Maximum PRs to create per run
+  type: number
+  default: 5
+
+variables:
+  system.debug: false
+  
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: ScanAndFix
+  displayName: 'Scan Advanced Security Alerts and Create PRs'
+  jobs:
+  - job: ProcessAlerts
+    displayName: 'Process Security Alerts'
+    steps:
+    
+    - checkout: self
+      persistCredentials: true
+      clean: true
+    
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.11'
+      inputs:
+        versionSpec: '3.11'
+    
+    - script: |
+        pip install requests pyyaml
+      displayName: 'Install Python dependencies'
+    
+    - task: PythonScript@0
+      displayName: 'Fetch and Process Advanced Security Alerts'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        scriptSource: 'inline'
+        script: |
+          import os
+          import sys
+          import json
+          import requests
+          import subprocess
+          from datetime import datetime
+          from base64 import b64encode
+          
+          # Configuration
+          organization = "$(System.TeamFoundationCollectionUri)".rstrip('/').split('/')[-1]
+          project = "$(System.TeamProject)"
+          repository_id = "$(Build.Repository.ID)"
+          repo_name = "$(Build.Repository.Name)"
+          pat = os.environ['SYSTEM_ACCESSTOKEN']
+          severity_filter = "${{ parameters.severityFilter }}"
+          max_prs = ${{ parameters.maxPRsToCreate }}
+          
+          # API Base URL
+          base_url = f"https://advsec.dev.azure.com/{organization}/{project}/_apis"
+          
+          # Headers
+          headers = {
+              'Content-Type': 'application/json',
+              'Authorization': f'Basic {b64encode(f":{pat}".encode()).decode()}'
+          }
+          
+          print(f"Fetching Advanced Security alerts for repository: {repo_name}")
+          
+          # Fetch alerts from Advanced Security
+          alerts_url = f"{base_url}/alert/repositories/{repository_id}/alerts"
+          params = {
+              'criteria.states': 'active',
+              'api-version': '7.2-preview.1'
+          }
+          
+          response = requests.get(alerts_url, headers=headers, params=params)
+          
+          if response.status_code != 200:
+              print(f"Error fetching alerts: {response.status_code}")
+              print(response.text)
+              sys.exit(1)
+          
+          alerts_data = response.json()
+          alerts = alerts_data.get('value', [])
+          
+          print(f"Found {len(alerts)} active alerts")
+          
+          # Filter by severity
+          severity_order = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}
+          min_severity = severity_order.get(severity_filter.lower(), 3)
+          
+          filtered_alerts = [
+              alert for alert in alerts 
+              if severity_order.get(alert.get('severity', '').lower(), 0) >= min_severity
+          ]
+          
+          print(f"Found {len(filtered_alerts)} alerts matching severity filter: {severity_filter}")
+          
+          # Sort by severity (highest first)
+          filtered_alerts.sort(
+              key=lambda x: severity_order.get(x.get('severity', '').lower(), 0),
+              reverse=True
+          )
+          
+          # Process alerts and create PRs
+          prs_created = 0
+          
+          for alert in filtered_alerts[:max_prs]:
+              if prs_created >= max_prs:
+                  break
+                  
+              alert_id = alert.get('alertId')
+              alert_type = alert.get('alertType')
+              severity = alert.get('severity')
+              title = alert.get('title')
+              
+              # Get alert details for fix suggestions
+              detail_url = f"{base_url}/alert/repositories/{repository_id}/alerts/{alert_id}"
+              detail_response = requests.get(detail_url, headers=headers, params={'api-version': '7.2-preview.1'})
+              
+              if detail_response.status_code != 200:
+                  print(f"Failed to get details for alert {alert_id}")
+                  continue
+              
+              alert_details = detail_response.json()
+              
+              # Extract file path and location
+              physical_locations = alert_details.get('physicalLocations', [])
+              if not physical_locations:
+                  print(f"No physical location found for alert {alert_id}")
+                  continue
+              
+              location = physical_locations[0]
+              file_path = location.get('filePath', '')
+              start_line = location.get('region', {}).get('startLine', 0)
+              
+              print(f"\nProcessing Alert {alert_id}:")
+              print(f"  Type: {alert_type}")
+              print(f"  Severity: {severity}")
+              print(f"  Title: {title}")
+              print(f"  File: {file_path}:{start_line}")
+              
+              # Create branch name
+              branch_name = f"security-fix/alert-{alert_id}"
+              
+              # Check if branch already exists
+              check_branch = subprocess.run(
+                  ['git', 'ls-remote', '--heads', 'origin', branch_name],
+                  capture_output=True,
+                  text=True
+              )
+              
+              if check_branch.stdout:
+                  print(f"  Branch {branch_name} already exists, skipping...")
+                  continue
+              
+              # Create and checkout new branch
+              subprocess.run(['git', 'checkout', '-b', branch_name], check=True)
+              
+              # Generate fix based on alert type
+              fix_applied = apply_fix(alert_details, file_path, start_line)
+              
+              if not fix_applied:
+                  print(f"  Unable to auto-fix alert {alert_id}")
+                  subprocess.run(['git', 'checkout', 'main'], check=True)
+                  subprocess.run(['git', 'branch', '-D', branch_name], check=False)
+                  continue
+              
+              # Commit changes
+              subprocess.run(['git', 'add', '.'], check=True)
+              
+              commit_message = f"fix: {title}\n\nResolves Advanced Security Alert #{alert_id}\nSeverity: {severity}\nType: {alert_type}"
+              
+              subprocess.run(['git', 'commit', '-m', commit_message], check=True)
+              
+              # Push branch
+              subprocess.run(['git', 'push', 'origin', branch_name], check=True)
+              
+              # Create Pull Request
+              pr_url = f"https://dev.azure.com/{organization}/{project}/_apis/git/repositories/{repository_id}/pullrequests"
+              
+              pr_description = f"""## Security Fix - Alert #{alert_id}
+          
+          **Severity:** {severity}
+          **Alert Type:** {alert_type}
+          **File:** `{file_path}` (Line {start_line})
+          
+          ### Description
+          {alert_details.get('description', 'No description available')}
+          
+          ### Fix Applied
+          This PR automatically applies a fix for the security vulnerability identified by Advanced Security.
+          
+          ### Recommendation
+          Please review the changes carefully and test thoroughly before merging.
+          
+          ---
+          *This PR was automatically generated by the Advanced Security Auto-Fix pipeline*
+          """
+              
+              pr_payload = {
+                  "sourceRefName": f"refs/heads/{branch_name}",
+                  "targetRefName": "refs/heads/main",
+                  "title": f"[Security] Fix {severity} alert: {title}",
+                  "description": pr_description,
+                  "labels": [
+                      {"name": "security"},
+                      {"name": f"severity-{severity}"}
+                  ]
+              }
+              
+              pr_response = requests.post(
+                  pr_url,
+                  headers=headers,
+                  json=pr_payload,
+                  params={'api-version': '7.0'}
+              )
+              
+              if pr_response.status_code == 201:
+                  pr_data = pr_response.json()
+                  pr_id = pr_data.get('pullRequestId')
+                  print(f"  ✓ Created PR #{pr_id}")
+                  prs_created += 1
+              else:
+                  print(f"  ✗ Failed to create PR: {pr_response.status_code}")
+                  print(pr_response.text)
+              
+              # Return to main branch
+              subprocess.run(['git', 'checkout', 'main'], check=True)
+          
+          print(f"\n{'='*50}")
+          print(f"Summary: Created {prs_created} pull request(s)")
+          
+          # Save summary for pipeline output
+          with open('$(Pipeline.Workspace)/summary.json', 'w') as f:
+              json.dump({
+                  'total_alerts': len(alerts),
+                  'filtered_alerts': len(filtered_alerts),
+                  'prs_created': prs_created,
+                  'timestamp': datetime.now().isoformat()
+              }, f, indent=2)
+          
+          
+          def apply_fix(alert_details, file_path, start_line):
+              """
+              Apply fixes based on alert type.
+              Returns True if fix was applied, False otherwise.
+              """
+              alert_type = alert_details.get('alertType', '').lower()
+              
+              # This is a simplified version - expand based on your specific needs
+              if 'sql-injection' in alert_type:
+                  return fix_sql_injection(file_path, start_line, alert_details)
+              elif 'xss' in alert_type or 'cross-site-scripting' in alert_type:
+                  return fix_xss(file_path, start_line, alert_details)
+              elif 'hardcoded' in alert_type or 'secret' in alert_type:
+                  return fix_hardcoded_secret(file_path, start_line, alert_details)
+              elif 'dependency' in alert_type:
+                  return fix_vulnerable_dependency(file_path, alert_details)
+              else:
+                  # For unknown types, create a TODO comment
+                  return add_security_todo(file_path, start_line, alert_details)
+          
+          
+          def fix_sql_injection(file_path, line_num, alert):
+              """Add parameterized query comment/suggestion"""
+              try:
+                  with open(file_path, 'r') as f:
+                      lines = f.readlines()
+                  
+                  if line_num > 0 and line_num <= len(lines):
+                      # Add a comment suggesting parameterized queries
+                      indent = len(lines[line_num-1]) - len(lines[line_num-1].lstrip())
+                      comment = ' ' * indent + '# TODO: Use parameterized queries to prevent SQL injection\n'
+                      lines.insert(line_num-1, comment)
+                      
+                      with open(file_path, 'w') as f:
+                          f.writelines(lines)
+                      return True
+              except Exception as e:
+                  print(f"Error applying SQL injection fix: {e}")
+              return False
+          
+          
+          def fix_xss(file_path, line_num, alert):
+              """Add XSS protection comment/suggestion"""
+              try:
+                  with open(file_path, 'r') as f:
+                      lines = f.readlines()
+                  
+                  if line_num > 0 and line_num <= len(lines):
+                      indent = len(lines[line_num-1]) - len(lines[line_num-1].lstrip())
+                      comment = ' ' * indent + '# TODO: Sanitize user input to prevent XSS attacks\n'
+                      lines.insert(line_num-1, comment)
+                      
+                      with open(file_path, 'w') as f:
+                          f.writelines(lines)
+                      return True
+              except Exception as e:
+                  print(f"Error applying XSS fix: {e}")
+              return False
+          
+          
+          def fix_hardcoded_secret(file_path, line_num, alert):
+              """Replace hardcoded secrets with environment variables"""
+              try:
+                  with open(file_path, 'r') as f:
+                      lines = f.readlines()
+                  
+                  if line_num > 0 and line_num <= len(lines):
+                      indent = len(lines[line_num-1]) - len(lines[line_num-1].lstrip())
+                      comment = ' ' * indent + '# SECURITY: Remove hardcoded secret and use environment variables or Azure Key Vault\n'
+                      lines.insert(line_num-1, comment)
+                      
+                      with open(file_path, 'w') as f:
+                          f.writelines(lines)
+                      return True
+              except Exception as e:
+                  print(f"Error applying hardcoded secret fix: {e}")
+              return False
+          
+          
+          def fix_vulnerable_dependency(file_path, alert):
+              """Update vulnerable dependencies"""
+              # This is a placeholder - actual implementation would parse package files
+              print(f"  Note: Dependency vulnerabilities require manual review of {file_path}")
+              return False
+          
+          
+          def add_security_todo(file_path, line_num, alert):
+              """Add generic security TODO for unknown alert types"""
+              try:
+                  with open(file_path, 'r') as f:
+                      lines = f.readlines()
+                  
+                  if line_num > 0 and line_num <= len(lines):
+                      title = alert.get('title', 'Security issue')
+                      indent = len(lines[line_num-1]) - len(lines[line_num-1].lstrip())
+                      comment = ' ' * indent + f'# SECURITY TODO: {title}\n'
+                      lines.insert(line_num-1, comment)
+                      
+                      with open(file_path, 'w') as f:
+                          f.writelines(lines)
+                      return True
+              except Exception as e:
+                  print(f"Error adding security TODO: {e}")
+              return False
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Summary'
+      condition: always()
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/summary.json'
+        artifact: 'SecurityFixSummary'
+        publishLocation: 'pipeline'

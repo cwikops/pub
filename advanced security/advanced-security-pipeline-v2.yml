@@ -1,0 +1,228 @@
+trigger: none
+
+schedules:
+- cron: "0 2 * * *"
+  displayName: Daily Advanced Security Auto-Fix
+  branches:
+    include:
+    - main
+  always: true
+
+parameters:
+- name: severityFilter
+  displayName: Minimum Severity to Fix
+  type: string
+  default: 'high'
+  values:
+  - critical
+  - high
+  - medium
+  - low
+
+- name: dryRun
+  displayName: Dry Run (don't create PRs)
+  type: boolean
+  default: false
+
+variables:
+  - name: pythonVersion
+    value: '3.11'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: SecurityAutoFix
+  displayName: 'Process Advanced Security Alerts'
+  jobs:
+  - job: ProcessAlerts
+    displayName: 'Fetch Alerts and Create PRs'
+    steps:
+    
+    - checkout: self
+      persistCredentials: true
+      clean: true
+      fetchDepth: 0
+    
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+    
+    - script: |
+        pip install requests pyyaml
+      displayName: 'Install Python dependencies'
+    
+    # Download config and script (if stored in repo)
+    - script: |
+        echo "Checking for security-fix-config.yml..."
+        if [ ! -f "security-fix-config.yml" ]; then
+          echo "Config file not found in repo, using defaults"
+        fi
+        
+        echo "Checking for security_alert_fixer.py..."
+        if [ ! -f "security_alert_fixer.py" ]; then
+          echo "Script not found in repo"
+          exit 1
+        fi
+        
+        chmod +x security_alert_fixer.py
+      displayName: 'Validate files'
+    
+    - script: |
+        python security_alert_fixer.py --severity "${{ parameters.severityFilter }}"
+      displayName: 'Run Security Alert Fixer'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        SYSTEM_COLLECTIONURI: $(System.TeamFoundationCollectionUri)
+        SYSTEM_TEAMPROJECT: $(System.TeamProject)
+        BUILD_REPOSITORY_ID: $(Build.Repository.ID)
+        BUILD_REPOSITORY_NAME: $(Build.Repository.Name)
+        PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+      condition: and(succeeded(), eq('${{ parameters.dryRun }}', 'false'))
+    
+    - script: |
+        echo "DRY RUN MODE - No PRs will be created"
+        python security_alert_fixer.py --severity "${{ parameters.severityFilter }}" --dry-run
+      displayName: 'Run Security Alert Fixer (Dry Run)'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        SYSTEM_COLLECTIONURI: $(System.TeamFoundationCollectionUri)
+        SYSTEM_TEAMPROJECT: $(System.TeamProject)
+        BUILD_REPOSITORY_ID: $(Build.Repository.ID)
+        BUILD_REPOSITORY_NAME: $(Build.Repository.Name)
+        PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+      condition: and(succeeded(), eq('${{ parameters.dryRun }}', 'true'))
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Execution Summary'
+      condition: always()
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/summary.json'
+        artifact: 'SecurityFixSummary'
+        publishLocation: 'pipeline'
+    
+    # Optional: Send Teams notification
+    - task: PowerShell@2
+      displayName: 'Send Teams Notification'
+      condition: and(succeeded(), ne(variables['TeamsWebhookUrl'], ''))
+      inputs:
+        targetType: 'inline'
+        script: |
+          $summary = Get-Content "$(Pipeline.Workspace)/summary.json" | ConvertFrom-Json
+          
+          $color = "0078D4"
+          if ($summary.prs_created -eq 0) {
+            $color = "808080"
+          }
+          
+          $body = @{
+            "@type" = "MessageCard"
+            "@context" = "https://schema.org/extensions"
+            "themeColor" = $color
+            "title" = "Advanced Security Auto-Fix Summary"
+            "summary" = "Created $($summary.prs_created) PRs for security fixes"
+            "sections" = @(
+              @{
+                "activityTitle" = "Execution Results"
+                "facts" = @(
+                  @{
+                    "name" = "Total Alerts"
+                    "value" = "$($summary.total_alerts)"
+                  },
+                  @{
+                    "name" = "Alerts Processed"
+                    "value" = "$($summary.alerts_processed)"
+                  },
+                  @{
+                    "name" = "PRs Created"
+                    "value" = "$($summary.prs_created)"
+                  },
+                  @{
+                    "name" = "Severity Filter"
+                    "value" = "${{ parameters.severityFilter }}"
+                  }
+                )
+              }
+            )
+            "potentialAction" = @(
+              @{
+                "@type" = "OpenUri"
+                "name" = "View Pipeline"
+                "targets" = @(
+                  @{
+                    "os" = "default"
+                    "uri" = "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                  }
+                )
+              }
+            )
+          } | ConvertTo-Json -Depth 10
+          
+          Invoke-RestMethod -Method Post -Uri "$(TeamsWebhookUrl)" -Body $body -ContentType "application/json"
+      env:
+        TeamsWebhookUrl: $(TeamsWebhookUrl)
+
+- stage: ReportSummary
+  displayName: 'Generate Report'
+  dependsOn: SecurityAutoFix
+  condition: succeededOrFailed()
+  jobs:
+  - job: GenerateReport
+    displayName: 'Create Summary Report'
+    steps:
+    
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Summary'
+      inputs:
+        artifactName: 'SecurityFixSummary'
+        targetPath: '$(Pipeline.Workspace)/summary'
+    
+    - task: PowerShell@2
+      displayName: 'Generate Markdown Report'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $summaryPath = "$(Pipeline.Workspace)/summary/summary.json"
+          
+          if (Test-Path $summaryPath) {
+            $summary = Get-Content $summaryPath | ConvertFrom-Json
+            
+            $report = @"
+          # Advanced Security Auto-Fix Summary
+          
+          **Execution Time:** $($summary.timestamp)
+          
+          ## Results
+          
+          | Metric | Count |
+          |--------|-------|
+          | Total Active Alerts | $($summary.total_alerts) |
+          | Alerts Processed | $($summary.alerts_processed) |
+          | PRs Created | $($summary.prs_created) |
+          
+          ## Status
+          
+          $($summary.status.ToUpper())
+          
+          ## Processed Alerts
+          
+          "@
+            
+            if ($summary.processed_details.Count -gt 0) {
+              $report += "`n| Alert ID | Severity | Status |`n"
+              $report += "|----------|----------|--------|`n"
+              
+              foreach ($detail in $summary.processed_details) {
+                $report += "| $($detail.alert_id) | $($detail.severity) | $($detail.status) |`n"
+              }
+            } else {
+              $report += "`nNo alerts were processed in this run.`n"
+            }
+            
+            $report | Out-File -FilePath "$(Pipeline.Workspace)/report.md" -Encoding utf8
+            
+            Write-Host "##vso[task.uploadsummary]$(Pipeline.Workspace)/report.md"
+          } else {
+            Write-Warning "Summary file not found"
+          }

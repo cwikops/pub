@@ -1,0 +1,129 @@
+# Advanced Security Auto-Fix Configuration
+
+## Alert Type Fix Strategies
+# Define how to handle different types of security alerts
+
+alert_strategies:
+  
+  sql-injection:
+    enabled: true
+    auto_fix: true
+    fix_type: "parameterized_query"
+    comment_template: |
+      # SECURITY FIX REQUIRED: SQL Injection vulnerability detected
+      # Replace string concatenation with parameterized queries
+      # Example: cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+  
+  xss:
+    enabled: true
+    auto_fix: true
+    fix_type: "sanitization"
+    comment_template: |
+      # SECURITY FIX REQUIRED: XSS vulnerability detected
+      # Sanitize user input before rendering
+      # Example: Use html.escape() or framework-specific escaping
+  
+  hardcoded-credentials:
+    enabled: true
+    auto_fix: true
+    fix_type: "environment_variable"
+    comment_template: |
+      # SECURITY FIX REQUIRED: Hardcoded credentials detected
+      # Move credentials to Azure Key Vault or environment variables
+      # Example: secret = os.environ.get('SECRET_NAME')
+  
+  insecure-randomness:
+    enabled: true
+    auto_fix: true
+    fix_type: "secure_random"
+    comment_template: |
+      # SECURITY FIX REQUIRED: Insecure random number generation
+      # Use secrets module instead of random
+      # Example: import secrets; token = secrets.token_hex(32)
+  
+  path-traversal:
+    enabled: true
+    auto_fix: true
+    fix_type: "path_validation"
+    comment_template: |
+      # SECURITY FIX REQUIRED: Path traversal vulnerability
+      # Validate and sanitize file paths
+      # Example: os.path.abspath(os.path.join(safe_dir, filename))
+  
+  command-injection:
+    enabled: true
+    auto_fix: false  # Too dangerous to auto-fix
+    fix_type: "manual_review"
+    comment_template: |
+      # CRITICAL SECURITY ISSUE: Command injection vulnerability
+      # This requires manual review and refactoring
+      # Avoid shell=True in subprocess calls and validate all inputs
+
+# PR Configuration
+pr_config:
+  # Auto-assign reviewers based on file paths
+  auto_assign_reviewers: true
+  default_reviewers:
+    - "security-team@company.com"
+  
+  # Add work items automatically
+  link_work_items: true
+  work_item_tag: "security"
+  
+  # Enable auto-complete for low severity issues after approval
+  auto_complete_enabled: false
+  
+  # Branch naming convention
+  branch_prefix: "security-fix"
+  
+  # Labels to apply
+  default_labels:
+    - "security"
+    - "automated-fix"
+
+# Notification Configuration
+notifications:
+  enabled: true
+  
+  # Send Teams notification
+  teams_webhook: ""  # Set in pipeline variables
+  
+  # Send email summary
+  email_enabled: false
+  email_recipients:
+    - "security-team@company.com"
+
+# File type specific configurations
+file_handling:
+  # Skip certain file types
+  exclude_patterns:
+    - "*.min.js"
+    - "*.min.css"
+    - "node_modules/**"
+    - "dist/**"
+    - "build/**"
+  
+  # Language-specific fix strategies
+  languages:
+    python:
+      use_black_formatter: true
+      use_isort: true
+    
+    javascript:
+      use_prettier: true
+      use_eslint: true
+    
+    csharp:
+      use_dotnet_format: true
+
+# Safety limits
+limits:
+  max_prs_per_run: 5
+  max_files_per_pr: 10
+  max_lines_changed_per_file: 50
+  
+# Logging
+logging:
+  level: "INFO"
+  include_alert_details: true
+  save_processed_alerts: true
