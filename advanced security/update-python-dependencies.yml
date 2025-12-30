@@ -29,7 +29,6 @@ parameters:
     default: 'main'
 
 variables:
-  - group: security-automation  # Should contain: GH_PAT or ADO_PAT
   - name: pythonVersion
     value: '3.11'
   - name: updateBranchName
@@ -60,102 +59,122 @@ stages:
             displayName: 'Install uv'
 
           - script: |
-              cat > scan_alerts.py << 'EOF'
-              #!/usr/bin/env python3
-              """
-              Scan for security vulnerabilities using multiple sources:
-              1. pip-audit for known CVEs
-              2. Parse requirements/pyproject for outdated packages
-              """
+              set -e
+              
+              echo "Fetching Advanced Security dependency alerts..."
+              
+              # Get organization and project from predefined variables
+              ORG_URL=$(echo "$(System.CollectionUri)" | sed 's:/*$::')
+              PROJECT="$(System.TeamProject)"
+              REPO_ID="$(Build.Repository.ID)"
+              
+              # Fetch dependency alerts from Advanced Security API
+              ALERTS_RESPONSE=$(curl -s -X GET \
+                -H "Authorization: Bearer $(System.AccessToken)" \
+                -H "Content-Type: application/json" \
+                "${ORG_URL}/${PROJECT}/_apis/alert/repositories/${REPO_ID}/alerts?api-version=7.2-preview.1&criteria.alertType=dependency&criteria.states=active")
+              
+              echo "$ALERTS_RESPONSE" > alerts_raw.json
+              
+              # Parse and extract vulnerable packages
+              python3 << 'EOF'
               import json
-              import subprocess
               import sys
-              from pathlib import Path
-
-              def run_pip_audit():
-                  """Run pip-audit to find vulnerable packages."""
-                  print("Running pip-audit scan...")
-                  result = subprocess.run(
-                      ["pip", "install", "pip-audit", "--quiet"],
-                      capture_output=True,
-                      text=True
-                  )
+              
+              with open("alerts_raw.json") as f:
+                  data = json.load(f)
+              
+              alerts = data.get("value", [])
+              
+              if not alerts:
+                  print("No active dependency alerts found")
+                  print("##vso[task.setvariable variable=hasVulnerabilities;isOutput=true]false")
+                  print("##vso[task.setvariable variable=vulnCount;isOutput=true]0")
+                  sys.exit(0)
+              
+              vulnerabilities = []
+              for alert in alerts:
+                  # Extract package info from the alert
+                  logical_locations = alert.get("logicalLocations", [])
                   
-                  # Check for requirements files
-                  req_files = list(Path(".").glob("**/requirements*.txt"))
-                  pyproject = Path("pyproject.toml")
+                  pkg_name = None
+                  pkg_version = None
                   
-                  vulnerabilities = []
+                  for loc in logical_locations:
+                      if loc.get("kind") == "package":
+                          full_name = loc.get("fullyQualifiedName", "")
+                          # Format is typically "package@version" or "ecosystem/package@version"
+                          if "@" in full_name:
+                              parts = full_name.rsplit("@", 1)
+                              pkg_name = parts[0].split("/")[-1]  # Remove ecosystem prefix if present
+                              pkg_version = parts[1] if len(parts) > 1 else None
+                          else:
+                              pkg_name = full_name.split("/")[-1]
                   
-                  for req_file in req_files:
-                      result = subprocess.run(
-                          ["pip-audit", "-r", str(req_file), "--format", "json", "--progress-spinner", "off"],
-                          capture_output=True,
-                          text=True
-                      )
-                      if result.stdout.strip():
-                          try:
-                              vulns = json.loads(result.stdout)
-                              vulnerabilities.extend(vulns)
-                          except json.JSONDecodeError:
-                              pass
+                  if not pkg_name:
+                      # Try getting from tools/dependency
+                      tools = alert.get("tools", [])
+                      for tool in tools:
+                          rules = tool.get("rules", [])
+                          for rule in rules:
+                              pkg_name = rule.get("name", "").split("/")[-1]
+                              break
                   
-                  if pyproject.exists():
-                      # For pyproject.toml, audit current environment
-                      result = subprocess.run(
-                          ["pip-audit", "--format", "json", "--progress-spinner", "off"],
-                          capture_output=True,
-                          text=True
-                      )
-                      if result.stdout.strip():
-                          try:
-                              vulns = json.loads(result.stdout)
-                              vulnerabilities.extend(vulns)
-                          except json.JSONDecodeError:
-                              pass
-                  
-                  return vulnerabilities
-
-              def main():
-                  vulnerabilities = run_pip_audit()
-                  
-                  # Deduplicate by package name
-                  unique_vulns = {}
-                  for vuln in vulnerabilities:
-                      pkg_name = vuln.get("name", "")
-                      if pkg_name and pkg_name not in unique_vulns:
-                          unique_vulns[pkg_name] = vuln
-                  
-                  vuln_list = list(unique_vulns.values())
-                  
-                  # Output results
-                  print(f"\nFound {len(vuln_list)} vulnerable package(s)")
-                  
-                  if vuln_list:
-                      print("\nVulnerable packages:")
-                      for v in vuln_list:
-                          print(f"  - {v.get('name', 'unknown')}: {v.get('version', '?')} -> {v.get('fix_versions', ['unknown'])}")
+                  if pkg_name:
+                      vuln_info = {
+                          "name": pkg_name,
+                          "version": pkg_version,
+                          "alert_id": alert.get("alertId"),
+                          "severity": alert.get("severity", "unknown"),
+                          "title": alert.get("title", ""),
+                          "cve": None,
+                          "fix_versions": []
+                      }
                       
-                      # Write to file for next stage
-                      with open("vulnerable_packages.json", "w") as f:
-                          json.dump(vuln_list, f, indent=2)
+                      # Extract CVE if available
+                      tools = alert.get("tools", [])
+                      for tool in tools:
+                          for rule in tool.get("rules", []):
+                              rule_id = rule.get("id", "")
+                              if rule_id.startswith("CVE-"):
+                                  vuln_info["cve"] = rule_id
+                              # Check for fix version in rule description
+                              desc = rule.get("fullDescription", {}).get("text", "")
+                              if "fixed in" in desc.lower():
+                                  # Try to extract fix version
+                                  pass
                       
-                      # Set pipeline variable
-                      print(f"##vso[task.setvariable variable=hasVulnerabilities;isOutput=true]true")
-                      print(f"##vso[task.setvariable variable=vulnCount;isOutput=true]{len(vuln_list)}")
+                      vulnerabilities.append(vuln_info)
+              
+              # Deduplicate by package name
+              unique_vulns = {}
+              for v in vulnerabilities:
+                  name = v["name"]
+                  if name not in unique_vulns:
+                      unique_vulns[name] = v
                   else:
-                      print("No vulnerabilities found!")
-                      print(f"##vso[task.setvariable variable=hasVulnerabilities;isOutput=true]false")
-                      print(f"##vso[task.setvariable variable=vulnCount;isOutput=true]0")
-                  
-                  return 0
-
-              if __name__ == "__main__":
-                  sys.exit(main())
+                      # Merge CVEs if multiple alerts for same package
+                      if v.get("cve") and not unique_vulns[name].get("cve"):
+                          unique_vulns[name]["cve"] = v["cve"]
+              
+              vuln_list = list(unique_vulns.values())
+              
+              print(f"\nFound {len(vuln_list)} vulnerable package(s) from Advanced Security:")
+              for v in vuln_list:
+                  cve = v.get("cve") or "N/A"
+                  print(f"  - {v['name']}@{v.get('version', '?')} [{v['severity']}] {cve}")
+              
+              # Save for next step
+              with open("vulnerable_packages.json", "w") as f:
+                  json.dump(vuln_list, f, indent=2)
+              
+              print(f"\n##vso[task.setvariable variable=hasVulnerabilities;isOutput=true]true")
+              print(f"##vso[task.setvariable variable=vulnCount;isOutput=true]{len(vuln_list)}")
               EOF
-              python scan_alerts.py
             name: scanAlerts
-            displayName: 'Scan for Security Vulnerabilities'
+            displayName: 'Fetch Advanced Security Dependency Alerts'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
           - script: |
               cat > update_deps.py << 'EOF'
@@ -259,17 +278,21 @@ stages:
                       # Write summary for PR description
                       with open("update_summary.md", "w") as f:
                           f.write("## Security Dependency Updates\n\n")
-                          f.write("This PR was automatically generated to address security vulnerabilities.\n\n")
+                          f.write("This PR was automatically generated to address **Azure DevOps Advanced Security** alerts.\n\n")
                           f.write("### Updated Packages\n\n")
                           for pkg in updated:
                               vuln = next((v for v in vulnerabilities if v.get("name") == pkg), {})
-                              vulns = vuln.get("vulns", [])
-                              cve_ids = [v.get("id", "Unknown") for v in vulns] if vulns else ["Security update"]
-                              f.write(f"- **{pkg}**: {', '.join(cve_ids)}\n")
+                              cve = vuln.get("cve") or "Security advisory"
+                              severity = vuln.get("severity", "unknown")
+                              alert_id = vuln.get("alert_id", "")
+                              f.write(f"- **{pkg}** ({severity}): {cve}")
+                              if alert_id:
+                                  f.write(f" - Alert #{alert_id}")
+                              f.write("\n")
                           f.write("\n### Actions Required\n\n")
-                          f.write("1. Review the changes\n")
+                          f.write("1. Review the dependency changes\n")
                           f.write("2. Run tests to ensure compatibility\n")
-                          f.write("3. Merge if all checks pass\n")
+                          f.write("3. Merge to resolve the security alerts\n")
                       
                       print("##vso[task.setvariable variable=hasUpdates;isOutput=true]true")
                   else:
@@ -310,6 +333,9 @@ stages:
               git config user.email "azure-pipelines@dev.azure.com"
               git config user.name "Azure Pipelines Security Bot"
               
+              # Configure git to use System.AccessToken
+              git remote set-url origin https://$(System.AccessToken)@dev.azure.com/$(System.CollectionUri)/$(System.TeamProject)/_git/$(Build.Repository.Name)
+              
               # Create and checkout new branch
               git checkout -b $(updateBranchName)
               
@@ -324,12 +350,14 @@ stages:
               Pipeline: $(Build.BuildNumber)
               Build ID: $(Build.BuildId)"
               
-              # Push branch
-              git push origin $(updateBranchName)
+              # Push branch using System.AccessToken
+              git -c http.extraheader="Authorization: Bearer $(System.AccessToken)" push origin $(updateBranchName)
               
               echo "Branch $(updateBranchName) pushed successfully"
             displayName: 'Create and Push Branch'
             condition: and(eq(variables['hasChanges'], 'true'), eq('${{ parameters.dryRun }}', false))
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
           - script: |
               set -e
