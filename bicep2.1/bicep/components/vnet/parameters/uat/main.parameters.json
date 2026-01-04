@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vnetName": {
+      "value": "vnet-myproject-uat-weu"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "addressPrefix": {
+      "value": "10.2.0.0/16"
+    },
+    "enableDdosProtection": {
+      "value": false
+    },
+    "subnets": {
+      "value": [
+        {
+          "name": "snet-default",
+          "addressPrefix": "10.2.1.0/24"
+        },
+        {
+          "name": "snet-app",
+          "addressPrefix": "10.2.2.0/24",
+          "serviceEndpoints": [
+            { "service": "Microsoft.KeyVault" },
+            { "service": "Microsoft.Storage" },
+            { "service": "Microsoft.Sql" }
+          ]
+        },
+        {
+          "name": "snet-data",
+          "addressPrefix": "10.2.3.0/24",
+          "privateEndpointNetworkPolicies": "Disabled"
+        },
+        {
+          "name": "snet-integration",
+          "addressPrefix": "10.2.4.0/24",
+          "delegations": [
+            {
+              "name": "Microsoft.Web.serverFarms",
+              "properties": {
+                "serviceName": "Microsoft.Web/serverFarms"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "tags": {
+      "value": {
+        "Environment": "uat",
+        "Project": "myproject",
+        "CostCenter": "UAT",
+        "Owner": "BusinessTeam"
+      }
+    }
+  }
+}

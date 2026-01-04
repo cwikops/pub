@@ -1,0 +1,181 @@
+# =============================================================================
+# Deploy Environment Template
+# Deploys all components for a single environment using component map
+# =============================================================================
+
+parameters:
+  - name: environment
+    type: string
+  - name: displayName
+    type: string
+  - name: serviceConnection
+    type: string
+  - name: resourceGroupName
+    type: string
+  - name: location
+    type: string
+  - name: requiresApproval
+    type: boolean
+    default: false
+  - name: dependsOn
+    type: object
+    default: []
+  - name: components
+    type: object
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: 'Deploy to ${{ parameters.displayName }}'
+    dependsOn: ${{ parameters.dependsOn }}
+    variables:
+      - name: resourceGroupName
+        value: ${{ parameters.resourceGroupName }}
+    
+    jobs:
+      # =========================================================================
+      # Approval Gate (if required)
+      # =========================================================================
+      - ${{ if eq(parameters.requiresApproval, true) }}:
+        - job: Approval_${{ parameters.environment }}
+          displayName: 'Approval Gate'
+          pool: server
+          steps:
+            - task: ManualValidation@0
+              displayName: 'Approve ${{ parameters.displayName }} Deployment'
+              timeoutInMinutes: 1440
+              inputs:
+                notifyUsers: |
+                  [email protected]
+                instructions: |
+                  Please review and approve the deployment to ${{ parameters.displayName }}.
+                  
+                  Components to deploy:
+                  ${{ each component in parameters.components }}
+                  - ${{ component.displayName }}
+                  ${{ end }}
+                onTimeout: 'reject'
+
+      # =========================================================================
+      # Deploy Components (generated from components parameter)
+      # =========================================================================
+      - ${{ each component in parameters.components }}:
+        - job: Deploy_${{ component.name }}_${{ parameters.environment }}
+          displayName: 'Deploy ${{ component.displayName }}'
+          dependsOn:
+            - ${{ if eq(parameters.requiresApproval, true) }}:
+              - Approval_${{ parameters.environment }}
+            - ${{ each dep in component.dependsOn }}:
+              - Deploy_${{ dep }}_${{ parameters.environment }}
+          pool:
+            vmImage: 'ubuntu-latest'
+          variables:
+            - ${{ if ne(component.scope, 'subscription') }}:
+              - name: rgName
+                value: ${{ parameters.resourceGroupName }}
+          steps:
+            - checkout: self
+              fetchDepth: 1
+
+            - task: AzureCLI@2
+              displayName: 'What-If ${{ component.displayName }}'
+              inputs:
+                azureSubscription: '${{ parameters.serviceConnection }}'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  echo "##[section]What-If analysis for ${{ component.displayName }}..."
+                  
+                  ${{ if eq(component.scope, 'subscription') }}
+                  az deployment sub what-if \
+                    --name "whatif-${{ component.name }}-${{ parameters.environment }}" \
+                    --location "${{ parameters.location }}" \
+                    --template-file "bicep/components/${{ component.name }}/main.bicep" \
+                    --parameters @bicep/components/${{ component.name }}/parameters/${{ parameters.environment }}/main.parameters.json
+                  ${{ else }}
+                  az deployment group what-if \
+                    --name "whatif-${{ component.name }}-${{ parameters.environment }}" \
+                    --resource-group "$(rgName)" \
+                    --template-file "bicep/components/${{ component.name }}/main.bicep" \
+                    --parameters @bicep/components/${{ component.name }}/parameters/${{ parameters.environment }}/main.parameters.json
+                  ${{ end }}
+
+            - task: AzureCLI@2
+              displayName: 'Deploy ${{ component.displayName }}'
+              name: deployOutput
+              inputs:
+                azureSubscription: '${{ parameters.serviceConnection }}'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  echo "##[section]Deploying ${{ component.displayName }}..."
+                  DEPLOY_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                  
+                  ${{ if eq(component.scope, 'subscription') }}
+                  deployment_output=$(az deployment sub create \
+                    --name "deploy-${{ component.name }}-${{ parameters.environment }}-$(Build.BuildNumber)" \
+                    --location "${{ parameters.location }}" \
+                    --template-file "bicep/components/${{ component.name }}/main.bicep" \
+                    --parameters @bicep/components/${{ component.name }}/parameters/${{ parameters.environment }}/main.parameters.json \
+                    --output json)
+                  ${{ else }}
+                  deployment_output=$(az deployment group create \
+                    --name "deploy-${{ component.name }}-${{ parameters.environment }}-$(Build.BuildNumber)" \
+                    --resource-group "$(rgName)" \
+                    --template-file "bicep/components/${{ component.name }}/main.bicep" \
+                    --parameters @bicep/components/${{ component.name }}/parameters/${{ parameters.environment }}/main.parameters.json \
+                    --output json)
+                  ${{ end }}
+                  
+                  if [ $? -eq 0 ]; then
+                    echo "##[section]✅ ${{ component.displayName }} deployed successfully"
+                    
+                    # Extract and set all outputs as pipeline variables
+                    echo "$deployment_output" | jq -r '.properties.outputs // {} | to_entries[] | "\(.key) \(.value.value)"' | while read key value; do
+                      if [ -n "$key" ]; then
+                        echo "##vso[task.setvariable variable=$key;isOutput=true]$value"
+                        echo "  Output: $key = $value"
+                      fi
+                    done
+                  else
+                    echo "##[error]❌ ${{ component.displayName }} deployment failed"
+                    exit 1
+                  fi
+
+      # =========================================================================
+      # Verification Job
+      # =========================================================================
+      - job: Verify_${{ parameters.environment }}
+        displayName: 'Verify Deployment'
+        dependsOn:
+          - ${{ each component in parameters.components }}:
+            - Deploy_${{ component.name }}_${{ parameters.environment }}
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Verify All Resources'
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "##[section]Verifying deployed resources for ${{ parameters.displayName }}..."
+                
+                echo "##[group]Resource Group"
+                az group show --name "${{ parameters.resourceGroupName }}" --output table
+                echo "##[endgroup]"
+                
+                echo "##[group]All Resources in Resource Group"
+                az resource list --resource-group "${{ parameters.resourceGroupName }}" --output table
+                echo "##[endgroup]"
+                
+                echo "##[section]✅ Verification completed for ${{ parameters.displayName }}"
+                echo ""
+                echo "=== Deployment Summary ==="
+                echo "Environment: ${{ parameters.displayName }}"
+                echo "Resource Group: ${{ parameters.resourceGroupName }}"
+                echo "Components deployed:"
+                ${{ each component in parameters.components }}
+                echo "  - ${{ component.displayName }}"
+                ${{ end }}
+                echo "=========================="

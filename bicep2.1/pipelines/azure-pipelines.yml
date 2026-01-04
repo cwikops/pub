@@ -1,0 +1,184 @@
+# =============================================================================
+# Azure Infrastructure Deployment Pipeline
+# Deploys components using Bicep modules with environment-specific configuration
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - bicep/**
+      - pipelines/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - bicep/**
+
+# =============================================================================
+# Pipeline Variables
+# =============================================================================
+variables:
+  - name: location
+    value: 'westeurope'
+  - name: vmImage
+    value: 'ubuntu-latest'
+
+# =============================================================================
+# Pipeline Parameters - Component Map per Environment
+# =============================================================================
+parameters:
+  - name: environments
+    type: object
+    default:
+      - name: dev
+        displayName: 'Development'
+        serviceConnection: 'azure-service-connection-dev'
+        resourceGroupName: 'rg-myproject-dev-weu'
+        requiresApproval: false
+        components:
+          - name: resourceGroup
+            displayName: 'Resource Group'
+            scope: subscription
+            dependsOn: []
+          - name: vnet
+            displayName: 'Virtual Network'
+            scope: resourceGroup
+            dependsOn:
+              - resourceGroup
+          - name: keyVault
+            displayName: 'Key Vault'
+            scope: resourceGroup
+            dependsOn:
+              - resourceGroup
+
+      - name: sit
+        displayName: 'System Integration Testing'
+        serviceConnection: 'azure-service-connection-sit'
+        resourceGroupName: 'rg-myproject-sit-weu'
+        requiresApproval: false
+        dependsOnEnv: dev
+        components:
+          - name: resourceGroup
+            displayName: 'Resource Group'
+            scope: subscription
+            dependsOn: []
+          - name: vnet
+            displayName: 'Virtual Network'
+            scope: resourceGroup
+            dependsOn:
+              - resourceGroup
+          - name: keyVault
+            displayName: 'Key Vault'
+            scope: resourceGroup
+            dependsOn:
+              - resourceGroup
+
+      - name: uat
+        displayName: 'User Acceptance Testing'
+        serviceConnection: 'azure-service-connection-uat'
+        resourceGroupName: 'rg-myproject-uat-weu'
+        requiresApproval: true
+        dependsOnEnv: sit
+        components:
+          - name: resourceGroup
+            displayName: 'Resource Group'
+            scope: subscription
+            dependsOn: []
+          - name: vnet
+            displayName: 'Virtual Network'
+            scope: resourceGroup
+            dependsOn:
+              - resourceGroup
+          - name: keyVault
+            displayName: 'Key Vault'
+            scope: resourceGroup
+            dependsOn:
+              - resourceGroup
+
+      - name: prod
+        displayName: 'Production'
+        serviceConnection: 'azure-service-connection-prod'
+        resourceGroupName: 'rg-myproject-prod-weu'
+        requiresApproval: true
+        dependsOnEnv: uat
+        components:
+          - name: resourceGroup
+            displayName: 'Resource Group'
+            scope: subscription
+            dependsOn: []
+          - name: vnet
+            displayName: 'Virtual Network'
+            scope: resourceGroup
+            dependsOn:
+              - resourceGroup
+          - name: keyVault
+            displayName: 'Key Vault'
+            scope: resourceGroup
+            dependsOn:
+              - resourceGroup
+
+# =============================================================================
+# Stages - Generated from environments parameter
+# =============================================================================
+stages:
+  # ===========================================================================
+  # Build Stage
+  # ===========================================================================
+  - stage: Build
+    displayName: 'Build & Validate'
+    jobs:
+      - job: ValidateBicep
+        displayName: 'Validate Bicep Templates'
+        pool:
+          vmImage: $(vmImage)
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: AzureCLI@2
+            displayName: 'Validate All Components'
+            inputs:
+              azureSubscription: 'azure-service-connection-dev'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "##[section]Validating Bicep templates..."
+                
+                for component in resourceGroup vnet keyVault; do
+                  echo "Validating: bicep/components/$component/main.bicep"
+                  az bicep build --file "bicep/components/$component/main.bicep" --stdout > /dev/null
+                  if [ $? -ne 0 ]; then
+                    echo "##[error]❌ Validation failed for $component"
+                    exit 1
+                  fi
+                done
+                
+                echo "##[section]✅ All Bicep templates validated successfully"
+
+  # ===========================================================================
+  # Deploy Stages - Generated per environment
+  # ===========================================================================
+  - ${{ each env in parameters.environments }}:
+    - template: templates/deploy-environment.yml
+      parameters:
+        environment: ${{ env.name }}
+        displayName: ${{ env.displayName }}
+        serviceConnection: ${{ env.serviceConnection }}
+        resourceGroupName: ${{ env.resourceGroupName }}
+        location: $(location)
+        requiresApproval: ${{ env.requiresApproval }}
+        ${{ if env.dependsOnEnv }}:
+          dependsOn:
+            - Build
+            - Deploy_${{ env.dependsOnEnv }}
+        ${{ else }}:
+          dependsOn:
+            - Build
+        components: ${{ env.components }}

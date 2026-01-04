@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vnetName": {
+      "value": "vnet-myproject-sit-weu"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "addressPrefix": {
+      "value": "10.1.0.0/16"
+    },
+    "enableDdosProtection": {
+      "value": false
+    },
+    "subnets": {
+      "value": [
+        {
+          "name": "snet-default",
+          "addressPrefix": "10.1.1.0/24"
+        },
+        {
+          "name": "snet-app",
+          "addressPrefix": "10.1.2.0/24",
+          "serviceEndpoints": [
+            { "service": "Microsoft.KeyVault" },
+            { "service": "Microsoft.Storage" }
+          ]
+        },
+        {
+          "name": "snet-data",
+          "addressPrefix": "10.1.3.0/24",
+          "privateEndpointNetworkPolicies": "Disabled"
+        }
+      ]
+    },
+    "tags": {
+      "value": {
+        "Environment": "sit",
+        "Project": "myproject",
+        "CostCenter": "Testing",
+        "Owner": "QATeam"
+      }
+    }
+  }
+}

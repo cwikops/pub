@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "keyVaultName": {
+      "value": "kv-myproject-sit-weu"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "skuName": {
+      "value": "standard"
+    },
+    "enableSoftDelete": {
+      "value": true
+    },
+    "softDeleteRetentionInDays": {
+      "value": 60
+    },
+    "enablePurgeProtection": {
+      "value": true
+    },
+    "enableRbacAuthorization": {
+      "value": true
+    },
+    "enabledForDeployment": {
+      "value": false
+    },
+    "enabledForDiskEncryption": {
+      "value": false
+    },
+    "enabledForTemplateDeployment": {
+      "value": true
+    },
+    "networkAcls": {
+      "value": {
+        "defaultAction": "Allow",
+        "bypass": "AzureServices",
+        "ipRules": [],
+        "virtualNetworkRules": []
+      }
+    },
+    "tags": {
+      "value": {
+        "Environment": "sit",
+        "Project": "myproject",
+        "CostCenter": "Testing",
+        "Owner": "QATeam"
+      }
+    }
+  }
+}

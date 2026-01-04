@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "keyVaultName": {
+      "value": "kv-myproject-prod-weu"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "skuName": {
+      "value": "premium"
+    },
+    "enableSoftDelete": {
+      "value": true
+    },
+    "softDeleteRetentionInDays": {
+      "value": 90
+    },
+    "enablePurgeProtection": {
+      "value": true
+    },
+    "enableRbacAuthorization": {
+      "value": true
+    },
+    "enabledForDeployment": {
+      "value": true
+    },
+    "enabledForDiskEncryption": {
+      "value": false
+    },
+    "enabledForTemplateDeployment": {
+      "value": true
+    },
+    "networkAcls": {
+      "value": {
+        "defaultAction": "Deny",
+        "bypass": "AzureServices",
+        "ipRules": [],
+        "virtualNetworkRules": []
+      }
+    },
+    "tags": {
+      "value": {
+        "Environment": "prod",
+        "Project": "myproject",
+        "CostCenter": "Production",
+        "Owner": "PlatformTeam",
+        "Criticality": "High"
+      }
+    }
+  }
+}

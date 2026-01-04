@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "resourceGroupName": {
+      "value": "rg-myproject-prod-weu"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "tags": {
+      "value": {
+        "Environment": "prod",
+        "Project": "myproject",
+        "CostCenter": "Production",
+        "Owner": "PlatformTeam",
+        "Criticality": "High"
+      }
+    }
+  }
+}

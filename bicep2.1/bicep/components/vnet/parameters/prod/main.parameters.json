@@ -1,0 +1,66 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vnetName": {
+      "value": "vnet-myproject-prod-weu"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "addressPrefix": {
+      "value": "10.3.0.0/16"
+    },
+    "enableDdosProtection": {
+      "value": true
+    },
+    "subnets": {
+      "value": [
+        {
+          "name": "snet-default",
+          "addressPrefix": "10.3.1.0/24"
+        },
+        {
+          "name": "snet-app",
+          "addressPrefix": "10.3.2.0/24",
+          "serviceEndpoints": [
+            { "service": "Microsoft.KeyVault" },
+            { "service": "Microsoft.Storage" },
+            { "service": "Microsoft.Sql" },
+            { "service": "Microsoft.ServiceBus" }
+          ]
+        },
+        {
+          "name": "snet-data",
+          "addressPrefix": "10.3.3.0/24",
+          "privateEndpointNetworkPolicies": "Disabled"
+        },
+        {
+          "name": "snet-integration",
+          "addressPrefix": "10.3.4.0/24",
+          "delegations": [
+            {
+              "name": "Microsoft.Web.serverFarms",
+              "properties": {
+                "serviceName": "Microsoft.Web/serverFarms"
+              }
+            }
+          ]
+        },
+        {
+          "name": "snet-management",
+          "addressPrefix": "10.3.5.0/24"
+        }
+      ]
+    },
+    "tags": {
+      "value": {
+        "Environment": "prod",
+        "Project": "myproject",
+        "CostCenter": "Production",
+        "Owner": "PlatformTeam",
+        "Criticality": "High"
+      }
+    }
+  }
+}
